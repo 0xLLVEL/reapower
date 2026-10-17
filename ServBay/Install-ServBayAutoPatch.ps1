@@ -98,7 +98,13 @@ $action = New-ScheduledTaskAction -Execute $ps `
     -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Quiet' -f $watch)
 
 $trigLogon = New-ScheduledTaskTrigger -AtLogOn
-$trigNet   = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(2)) `
+# The fallback's first fire is deliberately a full $FallbackHours away, not a couple
+# of minutes. This script already starts the watcher itself, so a near-term start
+# would only land on a live watcher, be refused by MultipleInstances=IgnoreNew, and
+# park 0x800710E0 in LastTaskResult next to a perfectly healthy task. It would also
+# bump NextRunTime so the real fallback drifted. Start it when the watcher is
+# genuinely overdue instead.
+$trigNet   = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddHours($FallbackHours)) `
     -RepetitionInterval (New-TimeSpan -Hours $FallbackHours) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
 
@@ -142,7 +148,8 @@ if ($watchProc.Count) {
 
 Write-Host ''
 Write-Host '--- status ---'
-Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State | Format-Table -AutoSize
+$t = Get-ScheduledTask -TaskName $TaskName
+Write-Host ("task      -> {0}  [{1}]" -f $t.TaskName, $t.State)
 Write-Host ("log       : {0}\watch.log  (watcher),  {0}\autopatch.log  (engine)" -f $StateDir)
 Write-Host ("rollback  : {0}\backup\*.dll  (copy over C:\ServBay\app\ServBay.dll)" -f $StateDir)
 Write-Host  'remove    : uninstall.cmd'

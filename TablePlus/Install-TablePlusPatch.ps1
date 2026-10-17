@@ -131,7 +131,11 @@ if (-not $NoTask) {
     $action = New-ScheduledTaskAction -Execute $ps -Argument $arg
 
     $tLogon = New-ScheduledTaskTrigger -AtLogOn
-    $tNet   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
+    # First fire a full $FallbackHours away, not a couple of minutes: the installer
+    # starts the watcher itself, so a near-term start only lands on a live watcher,
+    # gets refused by IgnoreNew, and parks 0x800710E0 in LastTaskResult beside a
+    # healthy task.
+    $tNet   = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddHours($FallbackHours)) `
                 -RepetitionInterval (New-TimeSpan -Hours $FallbackHours) `
                 -RepetitionDuration (New-TimeSpan -Days 3650)
 

@@ -27,6 +27,13 @@
       .NET Framework has no TimeSpan overload for it, and scriptblock
       EventArrived handlers never run while the main thread is blocked.
 
+  Gotcha
+    `$PSScriptRoot` is empty while PowerShell -File is still binding parameters,
+    so it cannot be used as a parameter default -- the default silently becomes
+    '' and Join-Path then throws before the script body ever runs. It gives a
+    plain exit code 1 and no log line, which is a miserable thing to debug from
+    Task Scheduler. $Engine is therefore resolved inside the body.
+
   Contract
     * Requires Administrator. Win32_ProcessStartTrace is admin-only.
     * The engine runs as a CHILD process. Both engines call `exit` at
@@ -54,7 +61,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]   $Engine      = (Join-Path $PSScriptRoot 'ServBayAutoPatch.ps1'),
+    [string]   $Engine,
     [string]   $ProcessName = 'ServBay.exe',
     [string[]] $EngineArgs  = @('-Quiet'),
     [string]   $StateDir    = 'C:\ProgramData\ServBayPatch',
@@ -147,6 +154,9 @@ function Invoke-Pass {
 }
 
 # ------------------------------------------------------------------ preflight
+# Resolved here, not as a parameter default: see the Gotcha note at the top.
+if (-not $Engine) { $Engine = Join-Path $PSScriptRoot 'ServBayAutoPatch.ps1' }
+
 Assert-Admin
 if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
 if (-not (Test-Path -LiteralPath $Engine))   { throw ('engine not found: ' + $Engine) }
