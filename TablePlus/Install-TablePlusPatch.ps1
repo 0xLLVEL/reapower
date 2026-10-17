@@ -1,16 +1,21 @@
 # TablePlus License Patch - installer
 #
-# Places the patch engine in C:\ProgramData\TablePlusPatch, patches the currently
-# installed TablePlus, then registers a scheduled task so the patch is re-applied
-# automatically after a TablePlus update (WinSparkle overwrites the exe).
+# Places the patch engine and its watcher in C:\ProgramData\TablePlusPatch, patches
+# the currently installed TablePlus, then registers a scheduled task that starts
+# the watcher once per session.
 #
-# -Uninstall : remove the task + restore the original exe from backup.
+# The old task polled every 10 minutes: 144 powershell births and ~21 GB of reads a
+# day, all to conclude "nothing changed". The task now starts an event-driven
+# watcher instead, which runs the engine only when TablePlus is actually opened.
+# See TablePlusPatchWatch.ps1.
+#
+# -Uninstall : stop the watcher, remove the task + restore the original exe from backup.
 
 [CmdletBinding()]
 param(
-    [string]$InstallDir = "C:\ProgramData\TablePlusPatch",
-    [string]$Target = "C:\Program Files\TablePlus\TablePlus.exe",
-    [int]$IntervalMinutes = 10,
+    [string]$InstallDir    = "C:\ProgramData\TablePlusPatch",
+    [string]$Target        = "C:\Program Files\TablePlus\TablePlus.exe",
+    [int]$FallbackHours    = 6,
     [switch]$Uninstall,
     [switch]$NoTask
 )
@@ -38,10 +43,29 @@ function Remove-Task([string]$name) {
     }
 }
 
+function Stop-Watcher {
+    # Match on the command line, not the image name: the watcher is a plain
+    # powershell.exe and killing every powershell.exe would be rude.
+    $killed = @()
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*TablePlusPatchWatch.ps1*" } |
+        ForEach-Object {
+            try {
+                Invoke-CimMethod -InputObject $_ -MethodName Terminate | Out-Null
+                $killed += $_.ProcessId
+            } catch {
+                Write-Host ("  could not stop watcher pid " + $_.ProcessId + ": " + $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
+    if ($killed.Count) { Write-Host ("  watcher stopped (pid " + ($killed -join ", ") + ")") -ForegroundColor Green }
+    else               { Write-Host  "  watcher not running" -ForegroundColor DarkGray }
+}
+
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Host ""
     Write-Host "TablePlus patch - uninstall" -ForegroundColor Cyan
+    Stop-Watcher
     Remove-Task $taskName
 
     $bak = "$Target.bak"
@@ -75,7 +99,10 @@ if (-not (Test-Path -LiteralPath $Target)) { Write-Host "  [x] TablePlus.exe not
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "backup") | Out-Null
 
-foreach ($f in @("TablePlusPatch.ps1", "TPCli.cs")) {
+# Stop the previous watcher before overwriting the script it is running.
+Stop-Watcher
+
+foreach ($f in @("TablePlusPatch.ps1", "TPCli.cs", "TablePlusPatchWatch.ps1")) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination $InstallDir -Force
     Write-Host ("  installed: " + (Join-Path $InstallDir $f)) -ForegroundColor Green
 }
@@ -97,25 +124,47 @@ if (-not (Test-Path -LiteralPath $bak2)) {
 if (-not $NoTask) {
     Remove-Task $taskName
 
-    $arg = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
-           (Join-Path $InstallDir "TablePlusPatch.ps1") + '" -Target "' + $Target +
-           '" -BackupDir "' + $InstallDir + '" -WaitForExitSeconds 120'
+    $watch = Join-Path $InstallDir "TablePlusPatchWatch.ps1"
+    $ps    = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $arg   = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $watch + '" -Quiet'
 
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arg
+    $action = New-ScheduledTaskAction -Execute $ps -Argument $arg
+
     $tLogon = New-ScheduledTaskTrigger -AtLogOn
-    $tPoll  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-                -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
+    $tNet   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
+                -RepetitionInterval (New-TimeSpan -Hours $FallbackHours) `
                 -RepetitionDuration (New-TimeSpan -Days 3650)
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                -StartWhenAvailable -MultipleInstances IgnoreNew `
-                -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+
+    try {
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable -MultipleInstances IgnoreNew `
+                    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    } catch {
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable -MultipleInstances IgnoreNew
+    }
+    # The watcher is meant to live for the whole session; the default PT72H
+    # would kill it every three days.
+    $settings.ExecutionTimeLimit = "PT0S"
+
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
                 -LogonType Interactive -RunLevel Highest
 
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($tLogon, $tPoll) `
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($tLogon, $tNet) `
         -Settings $settings -Principal $principal `
-        -Description "Re-applies the TablePlus license gate patch after an update." | Out-Null
-    Write-Host ("  task registered: " + $taskName + "  (logon + every $IntervalMinutes min, RunLevel Highest)") -ForegroundColor Green
+        -Description "Runs the TablePlus patch engine when TablePlus.exe starts after an update (event-driven, no polling)." | Out-Null
+    Write-Host ("  task registered: " + $taskName + "  (logon + " + $FallbackHours + "h fallback, RunLevel Highest)") -ForegroundColor Green
+
+    Start-ScheduledTask -TaskName $taskName
+    Start-Sleep -Seconds 4
+    $watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*TablePlusPatchWatch.ps1*" })
+    if ($watchProc.Count) {
+        Write-Host ("  watcher running: pid " + (($watchProc | ForEach-Object { $_.ProcessId }) -join ", ")) -ForegroundColor Green
+    } else {
+        Write-Host "  watcher not up yet - check the log" -ForegroundColor Yellow
+    }
+    Write-Host ("  log: " + (Join-Path $InstallDir "watch.log")) -ForegroundColor DarkGray
 }
 
 Write-Host ""

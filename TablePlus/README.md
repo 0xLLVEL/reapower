@@ -58,9 +58,9 @@ Target install path: `C:\Program Files\TablePlus\TablePlus.exe`
 2. done
 ```
 
-`install.cmd` self-elevates, copies the engine to `C:\ProgramData\TablePlusPatch\`,
-patches the exe that is installed right now, registers the scheduled task
-**TablePlus License Patch**, and prints status.
+`install.cmd` self-elevates, copies the engine and its watcher to
+`C:\ProgramData\TablePlusPatch\`, patches the exe that is installed right now, registers
+the scheduled task **TablePlus License Patch**, starts the watcher, and prints status.
 
 Manual control (no elevation needed to *view*, elevation needed to *write*):
 
@@ -262,13 +262,14 @@ prefers the one in `TablePlus.Source.Service.`, and patches it — tier `fuzzy`.
 free mode than corrupt the exe. When a gate is rewritten into an unrecognisable shape the
 engine leaves it alone, writes the fact to `tableplus-patch.log`, and shows one
 MessageBox per build (deduped through `state.json`, capped at 50 entries, so it does not
-nag every 10 minutes).
+nag on every launch).
 
 ### Idempotency and the fast path
 
 Before anything else, the file's SHA-256 is compared against `lastGood` in
 `state.json`. Equal → exit immediately: no 156 MB metadata parse, no waiting for a
-running `TablePlus` process. A poll with nothing to do costs one hash.
+running `TablePlus` process. A pass with nothing to do costs one hash — and a pass now
+only happens when TablePlus is actually opened.
 
 ---
 
@@ -318,9 +319,10 @@ a `-Keep` smaller than the metadata) instead of emitting a malformed file.
 TablePlus/
   README.md                        this file
   install.cmd                      self-elevating installer (double-click me)
-  uninstall.cmd                    removes the task + restores the original exe
-  Install-TablePlusPatch.ps1       copies engine, registers task, first run
+  uninstall.cmd                    stops the watcher, removes the task, restores the exe
+  Install-TablePlusPatch.ps1       copies engine + watcher, registers task, first run
   TablePlusPatch.ps1               the engine (find-by-name, SHA verify, in-place write)
+  TablePlusPatchWatch.ps1          event-driven trigger: runs the engine when TablePlus.exe starts
   TPCli.cs                         PE + CLI metadata reader and TINY-IL writer
                                    (runtime dependency of the engine — stays at top level)
 
@@ -336,8 +338,10 @@ Runtime layout after install:
 ```
 C:\ProgramData\TablePlusPatch\
   TablePlusPatch.ps1
+  TablePlusPatchWatch.ps1
   TPCli.cs
   tableplus-patch.log
+  watch.log                        one line per arm, dropped event and engine pass
   versions.txt                     one line per vendor build seen (date, sha, size)
   state.json                       { lastGood, warned[], when }
   backup\TablePlus.exe.orig        pristine, refreshed per vendor build
@@ -357,24 +361,49 @@ The scheduled task **TablePlus License Patch** closes that gap:
 
 | setting | value |
 |---|---|
-| triggers | at logon **+** every 10 minutes (3650-day repetition, first run +5 min) |
+| triggers | at logon **+** every 6 hours (fallback only — see below) |
 | run level | `Highest` (silent elevation; can write to `C:\Program Files\TablePlus`) |
-| action | `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ...\TablePlusPatch.ps1 -Target ... -BackupDir ... -WaitForExitSeconds 120` |
+| action | `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ...\TablePlusPatchWatch.ps1 -Quiet` |
 | multiple instances | `IgnoreNew` |
-| execution time limit | 15 min |
+| execution time limit | none (`PT0S`) — the watcher is meant to live for the whole session |
 | principal | interactive user, `RunLevel Highest` |
 
-Each poll is cheap (§7 fast path). When it does need to act, it:
+**The task does not poll.** It starts `TablePlusPatchWatch.ps1` once per session. That
+process subscribes to `Win32_ProcessStartTrace` — an ETW-backed WMI class, so the kernel
+pushes an event the moment a process is created — and then blocks on it. The engine runs
+only when `TablePlus.exe` actually starts.
 
-1. waits up to 120 s for the `TablePlus` process to exit (`-WaitForExitSeconds`), and
-   exits `3` if it is still locked
-2. refreshes `backup\TablePlus.exe.orig` **only if the file on disk is still a vendor
+Idle cost is one blocked `powershell.exe` (~70 MB working set), 0% CPU, 0 bytes read, zero
+polls. The previous design (logon + every 10 minutes) spawned ~144 `powershell.exe` a day
+and SHA256'd the 149 MB exe each time — roughly 21 GB read per day — to conclude "nothing
+changed". A `powershell.exe` spawn costs 1.16 s, a warm SHA256 of the exe 729 ms; the spawn
+was the bigger half, so the spawn is what had to go.
+
+The `IgnoreNew` + 6-hour pair is a fallback, not a poll: while the watcher is alive the
+trigger fires into nothing. It exists only to restart the watcher if it died mid-session.
+
+When it does need to act, it:
+
+1. refreshes `backup\TablePlus.exe.orig` **only if the file on disk is still a vendor
    build** (at least one site was pristine) and appends to `versions.txt`
-3. patches both sites, writing the new IL in place and zero-filling the surplus bytes
-4. moves the patched copy over the target atomically (write `.tp-new`, then `Move-Item -Force`)
-5. records `lastGood` in `state.json` and appends a line to `tableplus-patch.log`
+2. patches both sites, writing the new IL in place and zero-filling the surplus bytes
+3. moves the patched copy over the target atomically (write `.tp-new`, then `Move-Item -Force`)
+4. records `lastGood` in `state.json` and appends a line to `tableplus-patch.log`
 
-Worst case latency after an update: ~10 minutes (or one logon), one silent write.
+### Why the launch trigger still catches a blocked patch
+
+TablePlus holds its own exe open, so a patch cannot land while it is running. The old
+10-minute poll worked around that by retrying forever; a naive launch trigger would fire
+once, fail, and give up until the *next* launch.
+
+The watcher therefore treats exit code `3` (`target is still locked`) as a *pending* state.
+It wakes every 60 s and retries until the patch lands — which is normally the moment you
+close TablePlus. A session with nothing pending never wakes, and `-WaitForExitSeconds` is
+deliberately not passed to the engine: fail fast and let the watcher own the cadence rather
+than blocking a child process for 120 s on every attempt.
+
+Worst case latency after an update: one `TablePlus.exe` launch plus however long you keep
+it open, one silent write.
 
 The backup is **version-aware**: because `.orig` is only refreshed from a vendor build,
 it always holds the pristine copy of the build actually installed — never an older one.
@@ -481,7 +510,7 @@ not of this machine.
 ## 12. Rollback
 
 ```powershell
-# stop the automatic re-patching first, otherwise the next poll re-applies within 10 min
+# stop the automatic re-patching first, otherwise the next TablePlus launch re-applies it
 .\uninstall.cmd
 
 # then restore by hand if needed
@@ -549,15 +578,18 @@ streams (#~ dir, relative to MdBase, all sizes a multiple of 4)
 
 | symptom | cause | what it says |
 |---|---|---|
-| patch reverts after an update | scheduled task not installed | no log line at all |
-| poll runs but writes nothing | file already clean | `already clean (fast path, sha …) - done` |
+| patch reverts after an update | scheduled task not installed, or the watcher is not running | `watch.log` missing, or no `armed` line in it |
+| patch reverts after an update, watcher armed | the patch is pending because TablePlus stayed open | `patch pending - target still locked, retrying every 60s` |
+| pass runs but writes nothing | file already clean | `already clean (fast path, sha …) - done` |
 | one gate patched, one not | the other gate was rewritten | `unknown IL (shape differs too) - NOT touched` |
-| exit `3` | `TablePlus` still running, file locked | `TablePlus is still running - file is locked.` |
+| exit `3` | `TablePlus` still running, file locked → the watcher keeps retrying | `TablePlus is still running - file is locked.` |
 | exit `4` + one MessageBox | gate unrecognisable → dark | `nothing patchable, N dark site(s)` |
 | repeated notifications | — | deduped per site label in `state.json` |
 | exit `5` | body too small for the replacement | `FAILED to patch <site>` |
 | exit `2` | target missing | `target not found: <path>` |
 | no backup taken | file was already partially patched | the `.orig` refresh is skipped on purpose |
+| `armed` line stops appearing every 15 min | watcher died mid-session; the 6-hour fallback will restart it | `watch.log` ends without a later `armed` |
+| engine pass killed at 900 s | engine hung | `engine exceeded 900s - killed` |
 
 The engine prefers failing loudly over patching the wrong method: a 40,072-row method
 table contains plenty of ways to break an app by guessing.

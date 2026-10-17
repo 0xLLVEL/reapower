@@ -61,9 +61,9 @@ memcached, php-cgi ×6, node ×8).
 2. done
 ```
 
-`install.cmd` self-elevates, copies the engine to `C:\ProgramData\ServBayPatch\`,
-registers the scheduled task **ServBay AutoPatch**, runs the patch once, and prints
-status.
+`install.cmd` self-elevates, copies the engine and its watcher to
+`C:\ProgramData\ServBayPatch\`, registers the scheduled task **ServBay AutoPatch**, runs the
+patch once, starts the watcher, and prints status.
 
 Manual control (no elevation needed to *view*, elevation needed to *write*):
 
@@ -368,9 +368,10 @@ array. No metadata edits, ever.
 ServBay/
   README.md                        this file
   install.cmd                      self-elevating installer (double-click me)
-  uninstall.cmd                    removes the scheduled task
-  Install-ServBayAutoPatch.ps1     copies engine, registers task, first run
+  uninstall.cmd                    stops the watcher + removes the scheduled task
+  Install-ServBayAutoPatch.ps1     copies engine + watcher, registers task, first run
   ServBayAutoPatch.ps1             the engine (self-contained; C# embedded)
+  ServBayAutoPatchWatch.ps1        event-driven trigger: runs the engine when ServBay.exe starts
 
   tools/                           analysis helpers used to derive the above
     Cli.cs                         PE/CLI metadata parser: Load, Dump, FindRefs, FindPattern
@@ -391,10 +392,12 @@ Runtime layout after install:
 ```
 C:\ProgramData\ServBayPatch\
   ServBayAutoPatch.ps1
+  ServBayAutoPatchWatch.ps1
   Install-ServBayAutoPatch.ps1
   patch-now.cmd
   dry-run.cmd
   autopatch.log
+  watch.log
   state.json
   backup\ServBay.<version>.<sha8>.dll      pristine, per version
 ```
@@ -410,14 +413,31 @@ The scheduled task **ServBay AutoPatch** closes that gap:
 
 | setting | value |
 |---|---|
-| triggers | at logon **+** every 2 minutes (10-year repetition) |
+| triggers | at logon **+** every 6 hours (fallback only — see below) |
 | run level | `Highest` (silent elevation; can stop/start ServBay and write to `C:\ServBay\app`) |
-| action | `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ...\ServBayAutoPatch.ps1 -Quiet` |
+| action | `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ...\ServBayAutoPatchWatch.ps1 -Quiet` |
 | multiple instances | `IgnoreNew` |
-| execution time limit | 15 min |
+| execution time limit | none (`PT0S`) — the watcher is meant to live for the whole session |
 
-Each poll is cheap: it SHA256s `ServBay.dll` and exits immediately if the hash equals the
-hash recorded in `state.json`. When the hash differs (an update landed) it:
+**The task does not poll.** It starts `ServBayAutoPatchWatch.ps1` once per session. That
+process subscribes to `Win32_ProcessStartTrace` — an ETW-backed WMI class, so the kernel
+pushes an event the moment a process is created — and then blocks on it. The engine runs
+only when `ServBay.exe` actually starts, which is also the only moment a new patch can be
+needed.
+
+Idle cost is one blocked `powershell.exe` (~70 MB working set), 0% CPU, 0 bytes read, zero
+polls. The previous design (logon + every 2 minutes, 10-year repetition) spawned ~720
+`powershell.exe` a day and SHA256'd the 17 MB DLL each time, just to conclude "nothing
+changed".
+
+The trigger point is deliberately *before* any hash is computed: a fast-path miss on a
+17 MB DLL costs 90 ms, but a `powershell.exe` spawn costs 1.16 s — the spawn, not the
+hashing, is what made the old timer expensive.
+
+The `IgnoreNew` + 6-hour pair is a fallback, not a poll: while the watcher is alive the
+trigger fires into nothing. It exists only to restart the watcher if it died mid-session.
+
+When the hash in `state.json` no longer matches the DLL (an update landed) the engine:
 
 1. backs up the pristine binary to `backup\ServBay.<version>.<sha8>.dll`
 2. stops `ServBay*` processes (WMI `Win32_Process` → `Terminate`; `taskkill` is refused
@@ -427,7 +447,13 @@ hash recorded in `state.json`. When the hash differs (an update landed) it:
 5. restarts ServBay if it had been running
 6. appends everything to `autopatch.log`
 
-Worst case latency after an update: ~2 minutes, one ServBay restart.
+The watcher writes its own `watch.log`: one line per start, arm, dropped event and engine
+pass, with the engine's exit code. `ServBayAutoPatchWatch.ps1 -Once` runs a single pass and
+exits, which is the quickest way to check the wiring by hand.
+
+Worst case latency after an update: one `ServBay.exe` launch (or one logon, if the watcher
+was not running). ServBay restarting itself after a patch produces a second launch event;
+those are dropped by a 20 s debounce so a real patch costs exactly one engine pass.
 
 ---
 
@@ -473,7 +499,7 @@ Copy-Item "C:\ProgramData\ServBayPatch\backup\ServBay.1.34.4.2610.92462982.dll" 
 ```
 
 Or disable the automatic re-patching first (`uninstall.cmd`), then restore — otherwise the
-next poll re-applies the patch within 2 minutes.
+next `ServBay.exe` launch re-applies the patch.
 
 A `.bak` of the original is also kept next to the DLL by `legacy\patch_servbay.ps1`.
 
@@ -516,12 +542,15 @@ streams: #~ 14682032 (1966824)  #Strings 16648856 (272416)  #US 16921272 (12)
 
 | symptom | cause | what the log says |
 |---|---|---|
-| nothing happens after an update | scheduled task not installed | *fast path*: `up to date v… sha=…`, or no log at all |
+| nothing happens after an update | scheduled task not installed, or the watcher is not running | `watch.log` missing, or no `armed` line in it |
+| nothing happens after an update, watcher armed | ServBay never started, so no event ever fired | no `pass reason=launch` line in `watch.log` |
 | `404`-style miss on a gate | ServBay renamed the method | `SKIP gate … not-found` |
 | label stays "Free" | cctor shape changed, cipher not found | `SKIP label <reason>` — gates are still patched |
 | `SKIP gate … ret=… (not bool)` | name collision with a non-predicate | nothing patched for that name, on purpose |
 | backup not taken | binary was already partially patched | `binary was partially patched; no pristine backup taken` |
 | verification failure | a write did not land | `verification failed -- N change(s) still pending; restoring` + automatic restore |
+| `armed` line stops appearing every 15 min | watcher died mid-session; the 6-hour fallback will restart it | `watch.log` ends without a later `armed` |
+| engine pass killed at 900 s | engine hung | `engine exceeded 900s - killed` |
 
 The engine prefers failing loudly over patching the wrong method: a 45,310-row method
 table contains plenty of ways to break an app by guessing.
