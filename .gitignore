@@ -1,0 +1,19 @@
+# no vendor binaries, ever
+*.dll
+*.exe
+*.bak
+*.p7
+*.p8
+
+# analysis artefacts (regenerate with ServBay/tools)
+methods.tsv
+types.txt
+*_state/
+_teststate/
+work/
+
+# logs / captures
+*.log
+*.png
+sb_out.txt
+sb_err.txt
