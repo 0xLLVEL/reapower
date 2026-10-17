@@ -40,10 +40,10 @@ public class BlobPatch {
         while ((idx = all.IndexOf(needle, idx)) >= 0 && c < 40) {
             int a = Math.Max(0, idx - 6), len = Math.Min(70, all.Length - a);
             string seg = all.Substring(a, len).Replace("\n","\\n").Replace("\r","").Replace("\0",".");
-            sb.AppendLine(string.Format("    [{0}] len-nya bisa beda -> ...{1}", idx, seg));
+            sb.AppendLine(string.Format("    [{0}] length may differ -> ...{1}", idx, seg));
             idx += needle.Length; c++;
         }
-        if (c == 0) sb.AppendLine("    (tidak ada)");
+        if (c == 0) sb.AppendLine("    (none)");
         return sb.ToString();
     }
 }
@@ -51,25 +51,25 @@ public class BlobPatch {
 Set-Content -Path .\BlobPatch.cs -Value $cs -Encoding ASCII
 Add-Type -Path .\BlobPatch.cs -ErrorAction Stop
 
-Write-Output "=== stop ServBay (kalau jalan) ==="
+Write-Output "=== stop ServBay (if running) ==="
 Get-CimInstance Win32_Process -Filter "Name LIKE 'ServBay%'" -ErrorAction SilentlyContinue | ForEach-Object {
   Write-Output ("  terminate " + $_.Name); try { $_ | Invoke-CimMethod -MethodName Terminate | Out-Null } catch {}
 }
 Start-Sleep -Seconds 3
 
 [BlobPatch]::Load($Dll)
-Write-Output "=== string 'ServBay *' di dalam blob (kandidat label plan) ==="
+Write-Output "=== 'ServBay *' strings inside the blob (candidate plan labels) ==="
 foreach ($t in @("ServBay Free","ServBay Pro","ServBay Team")) {
   Write-Output ("  -- '{0}'" -f $t)
   Write-Output ([BlobPatch]::Scan($t))
 }
 
-Write-Output "=== PATCH: blob[329651..329663] 'ServBay Free' -> 'ServBay Pro ' (panjang sama 12) ==="
+Write-Output "=== PATCH: blob[329651..329663] 'ServBay Free' -> 'ServBay Pro ' (same length 12) ==="
 $before = [BlobPatch]::At(329651, 12)
 [BlobPatch]::Write(329651, "ServBay Pro ")
 $after  = [BlobPatch]::At(329651, 12)
-Write-Output ("  sebelum: '{0}'" -f $before)
-Write-Output ("  sesudah: '{0}'" -f $after)
+Write-Output ("  before: '{0}'" -f $before)
+Write-Output ("  after : '{0}'" -f $after)
 
 [IO.File]::WriteAllBytes($Dll, [BlobPatch]::Full)
 Copy-Item $Dll ".\ServBay.dll.p8" -Force

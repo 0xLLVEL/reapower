@@ -27,9 +27,9 @@ public class BlobDec {
         };
         foreach (var it in items) sb.AppendLine(string.Format("  blob[{0},len {1}] = '{2}'", it[0], it[1], At(p, it[0], it[1]).Replace("\n","\\n").Replace("\r","\\r")));
 
-        // semua kemunculan "ServBay" di blob
+        // every occurrence of "ServBay" inside the blob
         string all = Encoding.UTF8.GetString(p);
-        sb.AppendLine("  --- kemunculan 'ServBay' di blob (offset, cuplikan) ---");
+        sb.AppendLine("  --- occurrences of 'ServBay' in the blob (offset, excerpt) ---");
         int idx = 0; int n = 0;
         while ((idx = all.IndexOf("ServBay", idx)) >= 0 && n < 60) {
             int a = Math.Max(0, idx - 8), len = Math.Min(60, all.Length - a);

@@ -61,6 +61,19 @@ function Write-Log([string]$msg, [string]$level = 'INFO') {
     }
 }
 
+function Save-State($obj) {
+    # state.json is what makes the 2-minute poll cheap (fast path) and what keeps
+    # the patcher from re-running stop+start on ServBay every cycle. If this write
+    # fails it has to be loud, not silent.
+    try {
+        $obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+        return $true
+    } catch {
+        Write-Log ("FAILED to write state.json (" + $_.Exception.Message + ") - the next poll will redo the full pass and restart ServBay") 'ERROR'
+        return $false
+    }
+}
+
 function Get-ServBayProcesses {
     Get-CimInstance Win32_Process -Filter "Name LIKE 'ServBay%'" -ErrorAction SilentlyContinue
 }
@@ -304,6 +317,29 @@ public class SBP
 
     public void Save(string path) { File.WriteAllBytes(path, b); }
     public int Length { get { return b.Length; } }
+    public static int GateCount { get { return GateNames.Length; } }
+
+    // Every method body must sit fully inside the file. This is what catches a
+    // truncated / half-written DLL - exactly the cause of
+    // "BadImageFormatException: Bad IL format", which kills ServBay.exe a
+    // fraction of a second after its window appears.
+    public int BadBodies() {
+        int bad = 0;
+        for (int i = 0; i < Methods.Count; i++) {
+            Meth m = Methods[i];
+            if (m.Rva == 0) continue;
+            if (m.HdrOff < 0 || m.Fmt < 2 || m.Fmt > 3) { bad++; continue; }
+            if (m.Fmt == 3 && (m.HdrOff + 12 > b.Length || m.IlSize > 0x100000)) { bad++; continue; }
+            if (m.IlSize > 0 && (m.IlOff < 0 || m.IlOff + m.IlSize > b.Length)) { bad++; continue; }
+        }
+        return bad;
+    }
+
+    public static string Integrity(string path) {
+        SBP p = new SBP();
+        p.Load(path);
+        return p.Methods.Count + "\t" + p.BadBodies();
+    }
 
     static int IndexOf(byte[] hay, byte[] needle, int from) {
         int n = hay.Length - needle.Length;
@@ -494,6 +530,25 @@ function Invoke-Engine([string]$path, [bool]$apply) {
     return @{ Lines = $lines; Changes = $changes; Report = $report }
 }
 
+function Get-Integrity([string]$path) {
+    try {
+        $f = ([SBP]::Integrity($path)) -split "`t"
+        return @{ Methods = [int]$f[0]; Bad = [int]$f[1]; Err = '' }
+    } catch {
+        return @{ Methods = 0; Bad = -1; Err = $_.Exception.Message }
+    }
+}
+
+function Find-Pristine {
+    $c = @()
+    if (Test-Path -LiteralPath $BackupDir) {
+        $c += @(Get-ChildItem -LiteralPath $BackupDir -Filter 'ServBay*.dll' -ErrorAction SilentlyContinue)
+    }
+    if (Test-Path -LiteralPath ($Dll + '.bak')) { $c += @(Get-Item -LiteralPath ($Dll + '.bak')) }
+    if ($c.Count -eq 0) { return $null }
+    return ($c | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -507,7 +562,8 @@ if (-not (Test-Path -LiteralPath $Dll)) {
 
 $fi  = Get-Item -LiteralPath $Dll
 $cur = (Get-FileHash -LiteralPath $Dll -Algorithm SHA256).Hash
-$ver = $fi.VersionInfo.FileVersion
+try { $ver = $fi.VersionInfo.FileVersion } catch { $ver = 'unknown' }
+if (-not $ver) { $ver = 'unknown' }
 
 $state = $null
 if (Test-Path -LiteralPath $StatePath) {
@@ -524,14 +580,33 @@ Write-Log ("inspecting ServBay.dll v{0} sha={1} size={2}" -f $ver, $cur.Substrin
 
 Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop
 
+# --- broken DLL? repair it first, never patch on top of a corpse ------------
+# "Bad IL format" kills ServBay.exe before its window ever paints. When that
+# happens, do not restart ServBay with the same DLL.
+$pre = Get-Integrity $Dll
+if ($pre.Bad -ne 0) {
+    if ($pre.Bad -lt 0) { $why = "cannot parse: " + $pre.Err }
+    else { $why = "$($pre.Bad) method bodies outside the file bounds" }
+    Write-Log ("ServBay.dll is BROKEN - $why") 'ERROR'
+    $src = Find-Pristine
+    if (-not $src) { Write-Log "no pristine backup available - cannot repair" 'ERROR'; exit 4 }
+    $wasUp = Stop-ServBay
+    Start-Sleep -Milliseconds 300
+    Copy-Item -LiteralPath $src -Destination $Dll -Force
+    Write-Log ("restored from $src")
+    $pre = Get-Integrity $Dll
+    if ($pre.Bad -ne 0) { Write-Log "backup is not healthy either - stopping" 'ERROR'; exit 4 }
+    Write-Log ("DLL healthy again: {0} methods, 0 bad bodies" -f $pre.Methods) 'OK'
+    $cur = (Get-FileHash -LiteralPath $Dll -Algorithm SHA256).Hash
+}
+
 $dry = Invoke-Engine $Dll $false
 foreach ($ln in $dry.Lines) { Write-Log ("  " + $ln) 'TRACE' }
 
 if ($dry.Changes -eq 0) {
     Write-Log "no changes needed -- binary already patched" 'OK'
     if (-not $DryRun) {
-        [pscustomobject]@{ ok = $true; sha256 = $cur; version = $ver; patchedUtc = (Get-Date).ToUniversalTime().ToString('o'); changes = 0 } |
-            ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
+        Save-State ([pscustomobject]@{ ok = $true; sha256 = $cur; version = $ver; patchedUtc = (Get-Date).ToUniversalTime().ToString('o'); changes = 0 }) | Out-Null
     }
     exit 0
 }
@@ -541,8 +616,14 @@ if ($DryRun) {
     exit 0
 }
 
-# --- backup pristine binary (first time this version is seen) ---------------
-$pristine = -not ($dry.Lines | Where-Object { $_ -match 'gate.*CHANGE' })
+# --- vendor build backup (once per version) ---------------------------------
+# A backup is only taken when EVERY gate is still in its original form - i.e.
+# this is an untouched vendor build. If only some are, the file is the product
+# of an earlier patch and does not deserve the name "pristine".
+$gateFound   = @($dry.Lines | Where-Object { $_ -match '^(CHANGE|SKIP)\tgate' }).Count
+$gateChanges = @($dry.Lines | Where-Object { $_ -match '^CHANGE\tgate' }).Count
+$pristine = ($gateFound -gt 0 -and $gateChanges -eq $gateFound)
+$bk = $null
 if ($pristine) {
     $bk = Join-Path $BackupDir ('ServBay.' + $ver + '.' + $cur.Substring(0,8) + '.dll')
     if (-not (Test-Path -LiteralPath $bk)) {
@@ -550,7 +631,7 @@ if ($pristine) {
         Write-Log "pristine backup -> $bk"
     }
 } else {
-    Write-Log "binary was partially patched; no pristine backup taken" 'WARN'
+    Write-Log ("not a vendor build ({0}/{1} gates still original) - no pristine backup taken" -f $gateChanges, $gateFound) 'WARN'
 }
 
 # --- apply -----------------------------------------------------------------
@@ -562,25 +643,30 @@ try { Invoke-Engine $Dll $true | Out-Null }
 catch { Write-Log ("patch failed: " + $_.Exception.Message) 'ERROR'; if ($wasRunning -and -not $NoStop) { Start-ServBay }; exit 2 }
 
 $verify = Invoke-Engine $Dll $false
-if ($verify.Changes -ne 0) {
-    Write-Log ("verification failed -- {0} change(s) still pending; restoring" -f $verify.Changes) 'ERROR'
-    if ($pristine) {
-        Copy-Item -LiteralPath $bk -Destination $Dll -Force
-        Write-Log "restored pristine build" 'ERROR'
+$post   = Get-Integrity $Dll
+if ($verify.Changes -ne 0 -or $post.Bad -ne 0) {
+    if ($post.Bad -ne 0) { $why = "patched DLL is not healthy ($($post.Bad) bodies outside the bounds)" }
+    else { $why = "$($verify.Changes) change(s) still pending" }
+    Write-Log ("verification failed -- $why; restoring") 'ERROR'
+    if ($pristine) { $restoreFrom = $bk } else { $restoreFrom = Find-Pristine }
+    if ($restoreFrom) {
+        Copy-Item -LiteralPath $restoreFrom -Destination $Dll -Force
+        Write-Log ("restored from $restoreFrom") 'ERROR'
     }
     if ($wasRunning -and -not $NoStop) { Start-ServBay }
     exit 3
 }
+Write-Log ("integrity after patching: {0} methods, 0 bad bodies" -f $post.Methods) 'OK'
 
 $newHash = (Get-FileHash -LiteralPath $Dll -Algorithm SHA256).Hash
 Write-Log ("patched OK -- {0} site(s), sha={1}" -f $dry.Changes, $newHash.Substring(0,12)) 'OK'
 
-[pscustomobject]@{
+Save-State ([pscustomobject]@{
     ok = $true; sha256 = $newHash; version = $ver;
     patchedUtc = (Get-Date).ToUniversalTime().ToString('o');
     changes = $dry.Changes;
     sites = @($dry.Lines | Where-Object { $_ -match '^CHANGE' })
-} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+}) | Out-Null
 
 if ($wasRunning -and -not $NoRestart) { Start-ServBay }
 exit 0

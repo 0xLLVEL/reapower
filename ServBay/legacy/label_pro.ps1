@@ -9,10 +9,10 @@ Set-Location $Here
 
 function Stop-ServBay {
   $procs = Get-CimInstance Win32_Process -Filter "Name LIKE 'ServBay%'" -ErrorAction SilentlyContinue
-  if (-not $procs) { Write-Output "  (tidak ada proses ServBay)"; return }
+  if (-not $procs) { Write-Output "  (no ServBay process)"; return }
   foreach ($p in $procs) {
     Write-Output ("  terminate PID {0} {1}" -f $p.ProcessId, $p.Name)
-    try { $p | Invoke-CimMethod -MethodName Terminate | Out-Null } catch { Write-Output ("    gagal: " + $_.Exception.Message) }
+    try { $p | Invoke-CimMethod -MethodName Terminate | Out-Null } catch { Write-Output ("    failed: " + $_.Exception.Message) }
   }
   for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Milliseconds 500
@@ -39,14 +39,14 @@ foreach ($s in $SITES) {
   if (-not ($b[$s] -eq 0x72 -and $b[$s+1] -eq 0x01)) { $already = $false }
 }
 if ($already) {
-  Write-Output "  sudah dipatch sebelumnya, lewati"
+  Write-Output "  already patched before, skipping"
 } else {
   foreach ($s in $SITES) {
     if (-not ($b[$s] -eq 0x28 -and $b[$s+1] -eq 0x7B -and $b[$s+2] -eq 0x8C -and $b[$s+3] -eq 0x00 -and $b[$s+4] -eq 0x06)) {
-      throw ("site {0} bukan 'call 0x06008C7B'" -f $s)
+      throw ("site {0} is not 'call 0x06008C7B'" -f $s)
     }
   }
-  for ($i = 0; $i -lt 32; $i++) { if ($b[$P+$i] -ne 0) { throw "slot #US baru tidak zero" } }
+  for ($i = 0; $i -lt 32; $i++) { if ($b[$P+$i] -ne 0) { throw "new #US slot is not zero" } }
 
   $blk = New-Object byte[] 25
   $blk[0] = 0x00
@@ -62,7 +62,7 @@ if ($already) {
   foreach ($s in $SITES) { [Array]::Copy($LDSTR, 0, $b, $s, 5) }
 
   [IO.File]::WriteAllBytes($Dll, $b)
-  Write-Output ("  ditulis. #US -> off={0} size=25 token=0x70000001" -f ($P - $u.MdBase))
+  Write-Output ("  written. #US -> off={0} size=25 token=0x70000001" -f ($P - $u.MdBase))
 }
 
 $v = [IO.File]::ReadAllBytes($Dll)
@@ -80,5 +80,5 @@ if (-not $NoRestart) {
   Start-Process -FilePath $Exe
   Start-Sleep -Seconds 12
   $p = Get-Process -Name ServBay -ErrorAction SilentlyContinue
-  if ($p) { Write-Output ("  jalan, PID {0}" -f $p.Id) } else { Write-Output "  TIDAK jalan" }
+  if ($p) { Write-Output ("  running, PID {0}" -f $p.Id) } else { Write-Output "  NOT running" }
 }

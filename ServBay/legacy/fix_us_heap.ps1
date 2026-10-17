@@ -14,16 +14,16 @@ foreach ($p in $procs) {
 }
 Start-Sleep -Seconds 3
 
-Write-Output "=== 2. pindahkan #US ke [17244932,17244960) (masih di dalam VirtualSize .text) ==="
+Write-Output "=== 2. move #US to [17244932,17244960) (still inside .text VirtualSize) ==="
 Add-Type -Path "$Here\Usx3.cs" -ErrorAction Stop
 $u = New-Object Usx3
 $u.Load($Dll)
 $b = [IO.File]::ReadAllBytes($Dll)
 
-$P = 17244932                      # awal area bebas terakhir yang ter-map
+$P = 17244932                      # start of the last mapped free area
 $need = 25
-$mapEnd = 17244960                 # batas akhir .text yang ter-map (VA 0x2000 + VSize 0x1072120)
-if (($P + $need) -gt $mapEnd) { throw "slot tidak cukup" }
+$mapEnd = 17244960                 # end of the mapped .text (VA 0x2000 + VSize 0x1072120)
+if (($P + $need) -gt $mapEnd) { throw "not enough room in the slot" }
 
 $blk = New-Object byte[] $need
 $blk[0] = 0x00
@@ -38,7 +38,7 @@ $blk[24] = 0x00
 [IO.File]::WriteAllBytes($Dll, $b)
 Write-Output ("  #US -> off rel MdBase = {0}  (abs {1})  size {2}  token 0x70000001" -f ($P-$u.MdBase), $P, $need)
 
-Write-Output "=== 3. verifikasi byte ==="
+Write-Output "=== 3. verify bytes ==="
 $v = [IO.File]::ReadAllBytes($Dll)
 foreach ($s in @(1577109,2678828,2678895)) {
   $h=""; for($i=0;$i -lt 5;$i++){ $h += ("{0:X2} " -f $v[$s+$i]) }
@@ -48,16 +48,16 @@ $h2=""; for($i=0;$i -lt 25;$i++){ $h2 += ("{0:X2} " -f $v[$P+$i]) }
 Write-Output ("  #US  {0}: {1}" -f $P,$h2)
 Write-Output ("  entry: off={0} size={1}" -f [BitConverter]::ToUInt32($v,$u.UsEntryPos), [BitConverter]::ToUInt32($v,$u.UsSizePos))
 
-Write-Output "=== 4. jalankan ServBay (tangkap output) ==="
+Write-Output "=== 4. launch ServBay (capture output) ==="
 Remove-Item "$Here\sb_out.txt","$Here\sb_err.txt" -ErrorAction SilentlyContinue
 $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardOutput "$Here\sb_out.txt" -RedirectStandardError "$Here\sb_err.txt"
 Write-Output ("  PID " + $p.Id)
 Start-Sleep -Seconds 20
 $still = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
 if ($still) {
-  Write-Output "  MASIH JALAN"
+  Write-Output "  STILL RUNNING"
 } else {
-  Write-Output ("  MATI. ExitCode = " + $p.ExitCode)
+  Write-Output ("  DIED. ExitCode = " + $p.ExitCode)
 }
 Write-Output "--- stdout ---"
 if (Test-Path "$Here\sb_out.txt") { Get-Content "$Here\sb_out.txt" -Tail 40 | Write-Output }
