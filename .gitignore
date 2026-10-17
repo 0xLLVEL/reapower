@@ -7,10 +7,12 @@
 
 # analysis artefacts (regenerate with ServBay/tools)
 methods.tsv
+tp_methods.tsv
 types.txt
 *_state/
 _teststate/
 work/
+sim/
 
 # logs / captures
 *.log
