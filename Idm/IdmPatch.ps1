@@ -1,22 +1,52 @@
 # Internet Download Manager - License Gate Patch (Windows x86)
 #
-# Patches two functions inside IDMan.exe in place. Nine bytes, nothing else:
-# the section table, every other section, the imports, the resources and the
-# relocations are left exactly as shipped.
+# Patches IDMan.exe in place. Fifty-three bytes across four sites, nothing
+# else: the section table, every other section, the imports, the relocations
+# and the rest of the resources are left exactly as shipped.
 #
-#   1) startup validator  (file 0x04FF40, 3 bytes)
+# Sites 1 and 2 neutralise the enforcement gates. Sites 3 and 4 are
+# presentational only - they change what the About dialog says, not what the
+# program does. All four read the trial global 0x77BD24; none of them write
+# it, and no state that gates a download is touched.
+#
+#   1) startup validator  (file 0x04FF40, .text, 3 bytes)
 #        original prologue: 55 8D AC 24 DC FB FF FF 81 EC 24 04 00 00 ...
 #        new               : 31 C0 C3            (xor eax,eax ; ret)
 #
-#   2) nag / exit gate    (file 0x04C2F0, 6 bytes)
+#   2) nag / exit gate    (file 0x04C2F0, .text, 6 bytes)
 #        original prologue: 55 8D AC 24 9C F7 FF FF 81 EC 64 08 00 00 ...
 #        new               : B8 01 00 00 00 C3   (mov eax,1 ; ret)
 #
-# Both are replaced at the prologue, before any stack frame is allocated, so
-# neither touches ESP, EBP or any callee-saved register on the way out. The
-# caller's stack stays balanced and the return value lands in EAX, which is
-# exactly what the callers read. The rest of each original body becomes dead
-# code behind the ret and is never reached.
+#   3) About: version suffix (file 0x002DD6, .text, 2 bytes)
+#        CAboutDlg::OnInitDialog chooses between the two literals
+#        "Trial" (0x696E50) and "Full" (0x696E48) with
+#            39 1D 24 BD 77 00   cmp dword [0x77BD24], ebx  ; ebx = 0
+#            74 07               je   -> "Full"
+#            68 50 6E 69 00      push "Trial"
+#            EB 05               jmp  -> past "Full"
+#            68 48 6E 69 00      push "Full"
+#        Flipping 74 -> EB makes the branch unconditional, so the version
+#        line reads "... Full" instead of "... Trial" on every build.
+#
+#   4) About: licensee line (file 0x38DB5C, .rsrc, 42 bytes)
+#        The dialog template for RT_DIALOG id=100 ships the static control
+#        0x049D with the placeholder "Unregistered Version". Runtime only
+#        replaces it when [0x77BD24] == 0 *and* HKLM holds a licensee name,
+#        so on a trial build the placeholder is what stays on screen.
+#        Replaced in place, UTF-16, same character count, same byte count:
+#        "Registered Version" plus two trailing spaces. The resource parser
+#        walks item boundaries off the string terminator, which is why the
+#        replacement has to be exactly as long as what it replaces.
+#
+# Sites 1 and 2 are replaced at the prologue, before any stack frame is
+# allocated, so neither touches ESP, EBP or any callee-saved register on the
+# way out. The caller's stack stays balanced and the return value lands in
+# EAX, which is exactly what the callers read. The rest of each original body
+# becomes dead code behind the ret and is never reached. Sites 3 and 4 change
+# one branch and one string: no register, no stack slot, no global.
+#
+# Writing the four original signatures back over a patched file reproduces the
+# pristine sha256 byte for byte - the patch provably touches nothing else.
 #
 # Exit codes:
 #   0  patched, already clean, or fast-path confirmed
@@ -47,7 +77,7 @@ $Script:ExitDark     = 4
 $Script:ExitVerify   = 5
 
 $Script:PristineSha = 'E3FC655A335E17A6FDD09A9B315291D0C8863180F0D801E5DD7433C9E56AFBD8'
-$Script:PatchedSha  = 'AF844CB09B2B9FFF1C4FDE5D9B051BE93DB1FB08D54EB92CE33C653F4836FA25'
+$Script:PatchedSha  = 'FF658CE12E67D813037B68F54FA7DC0F63B7787641CFF8E095D83814E2704547'
 
 if (-not $Target) {
     $Target = Join-Path ${env:ProgramFiles(x86)} 'Internet Download Manager\IDMan.exe'
@@ -59,27 +89,56 @@ if (-not $StateDir) {
 # Identity of each site.
 #
 #   Offset  known file offset on the pristine build (exact tier)
-#   Sig     byte signature that is unique across .text (shape tier)
+#   Section PE section the signature is scanned in (shape tier)
+#   Sig     byte signature that is unique inside that section (shape tier)
 #   Patch   replacement bytes, written over the first bytes of Sig
 #
-# Sig is deliberately cut before the SEH handler's `push imm32`: that immediate
-# is an absolute address, relocated by the loader, so it is the one part of the
-# prologue that is not a stable cross-build identity. Disk bytes are the
-# unrelocated form and are identical on every machine for a given build.
+# Sig is deliberately cut before the SEH handler's `push imm32` on sites 1 and
+# 2: that immediate is an absolute address, relocated by the loader, so it is
+# the one part of the prologue that is not a stable cross-build identity. Disk
+# bytes are the unrelocated form and are identical on every machine for a
+# given build. Sites 3 and 4 are literal data - a branch byte and a UTF-16
+# string - so neither has a relocation in it either.
 $Sites = @(
     [pscustomobject]@{
-        Name   = 'startup_validator'
-        Label  = 'startup validator -> status 0 (clean)'
-        Offset = 0x04FF40
-        Sig    = '558dac24dcfbffff81ec240400006aff6870'
-        Patch  = '31c0c3'
+        Name    = 'startup_validator'
+        Label   = 'startup validator -> status 0 (clean)'
+        Offset  = 0x04FF40
+        Section = '.text'
+        Sig     = '558dac24dcfbffff81ec240400006aff6870'
+        Patch   = '31c0c3'
     },
     [pscustomobject]@{
-        Name   = 'nag_exit_gate'
-        Label  = 'nag / exit gate -> return 1 (continue)'
-        Offset = 0x04C2F0
-        Sig    = '558dac249cf7ffff81ec640800'
-        Patch  = 'B801000000C3'
+        Name    = 'nag_exit_gate'
+        Label   = 'nag / exit gate -> return 1 (continue)'
+        Offset  = 0x04C2F0
+        Section = '.text'
+        Sig     = '558dac249cf7ffff81ec640800'
+        Patch   = 'B801000000C3'
+    },
+    [pscustomobject]@{
+        Name    = 'about_version_full'
+        Label   = 'About version suffix -> always "Full" (was "Trial")'
+        Offset  = 0x002DD6
+        Section = '.text'
+        #   39 1D 24 BD 77 00   cmp dword [0x77BD24], ebx
+        #   74 07               je   -> push "Full"
+        #   68 50 6E 69 00      push "Trial"
+        #   EB 05               jmp  -> past "Full"
+        #   68 48 6E 69 00      push "Full"
+        Sig     = '740768506E6900EB0568486E6900'
+        Patch   = 'EB07'
+    },
+    [pscustomobject]@{
+        Name    = 'about_licensee_text'
+        Label   = 'About licensee line -> "Registered Version" (was "Unregistered Version")'
+        Offset  = 0x38DB5C
+        Section = '.rsrc'
+        # UTF-16, 20 characters plus terminator, both strings. The resource
+        # parser advances to the next dialog item off the terminator, so the
+        # replacement must be exactly the length of the original.
+        Sig     = '55006e0072006500670069007300740065007200650064002000560065007200730069006f006e000000'
+        Patch   = '52006500670069007300740065007200650064002000560065007200730069006f006e00200020000000'
     }
 )
 
@@ -230,13 +289,26 @@ if ($Restore) {
 
 # ---------------------------------------------------------------------------
 # fast path: already at the hash this engine last confirmed good
+#
+# Two conditions, not one. lastGoodSha alone is not enough: a state.json written
+# by an older engine records the hash of *its* patch set, and a newer engine
+# with more sites would see that hash match, declare "already patched", and
+# never apply the sites it added. Requiring the state's target hash to be this
+# engine's own makes a stale state fall through to a real run instead.
 # ---------------------------------------------------------------------------
 $curSha = (Get-FileHash -LiteralPath $Target -Algorithm SHA256).Hash
 $state  = Read-State -Path $StatePath
 
-if ($state -and $state.lastGoodSha -and -not $Force -and $state.lastGoodSha -eq $curSha) {
+$stateIsCurrent = $state -and
+                  $state.patchedSha -and
+                  $state.patchedSha -eq $Script:PatchedSha
+
+if ($stateIsCurrent -and $state.lastGoodSha -and -not $Force -and $state.lastGoodSha -eq $curSha) {
     Write-Host "  [fast] already patched, hash confirmed ($($curSha.Substring(0,16))...)" -ForegroundColor Green
     exit $Script:ExitOk
+}
+if ($state -and $state.lastGoodSha -and $state.lastGoodSha -eq $curSha -and -not $stateIsCurrent) {
+    Write-Note "  [i] state.json is from an older patch set - re-checking all sites" 'DarkGray'
 }
 if ($curSha -eq $Script:PristineSha -and -not $Force) {
     # pristine but state missing - fall through to a normal patch run
@@ -331,9 +403,9 @@ foreach ($site in $Sites) {
     $alreadyAll = $false
 
     $sigHex = $site.Sig.ToLower()
-    $hits   = $cli.FindInSection('.text', $sigHex)
+    $hits   = $cli.FindInSection($site.Section, $sigHex)
     if ($hits.Length -eq 1 -and $hits[0] -eq -1) {
-        $dark += "$($site.Name): section .text not present"
+        $dark += "$($site.Name): section $($site.Section) not present"
         break
     }
     $entry.hits = $hits.Length
@@ -352,7 +424,7 @@ foreach ($site in $Sites) {
             $entry.offset = $hits[0]
             $entry.tier   = 'shape'
         } elseif ($hits.Length -eq 0) {
-            $dark += "$($site.Name): signature not found in .text (build changed)"
+            $dark += "$($site.Name): signature not found in $($site.Section) (build changed)"
         } else {
             $dark += "$($site.Name): signature ambiguous - $($hits.Count) hits at $($hits | ForEach-Object { '0x{0:X}' -f $_ })"
         }
@@ -365,7 +437,7 @@ foreach ($site in $Sites) {
     }
 
     if ($entry.tier) {
-        $entry.before = $cli.ReadHex($entry.offset, $site.Patch.Length)
+        $entry.before = $cli.ReadHex($entry.offset, $site.Patch.Length / 2)
         $plan += [pscustomobject]$entry
     }
 }
@@ -378,7 +450,7 @@ if ($alreadyAll -and $plan.Count -eq $Sites.Count) {
             lastGoodSha    = $onDisk
             patchedSha     = $Script:PatchedSha
             patchedOffsets = @($Sites | ForEach-Object { '0x{0:X}' -f $_.Offset })
-            patchedBytes   = 9
+            patchedBytes   = ($Sites | ForEach-Object { $_.Patch.Length / 2 } | Measure-Object -Sum).Sum
             tier           = 'already'
             lastRunUtc     = (Get-Date).ToUniversalTime().ToString('o')
         }
@@ -510,7 +582,8 @@ if (Test-Path -LiteralPath $darkNotifiedPath) {
     Remove-Item -LiteralPath $darkNotifiedPath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "  [ok] $($Sites.Count) sites patched, 9 bytes total" -ForegroundColor Green
+$patchedTotal = ($plan | ForEach-Object { $_.after.Length / 2 } | Measure-Object -Sum).Sum
+Write-Host "  [ok] $($Sites.Count) sites patched, $patchedTotal bytes total" -ForegroundColor Green
 Write-Note ("       sha256 {0}" -f $finalSha) 'DarkGray'
 Write-Note "       next IDM update overwrites the binary - re-run patch-now.cmd" 'DarkGray'
 exit $Script:ExitOk

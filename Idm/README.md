@@ -6,8 +6,8 @@ genuine" dialog — IDMan.exe starts as if the check came back clean.
 
 Everything here operates on your own installation, on disk, with no network calls and no
 license server interaction. It is an analysis of a shipped native binary and a byte-level
-patch of it: **9 bytes of 6,201,712**, and every one of those bytes sits in the first six
-bytes of two function prologues.
+patch of it: **29 bytes of 6,201,712 actually differ**, written across four sites — two that
+neutralise the license gates, two that change what the About dialog prints.
 
 ---
 
@@ -17,7 +17,7 @@ bytes of two function prologues.
 2. [TL;DR — install](#2-tldr--install)
 3. [What it does / what it does NOT do](#3-what-it-does--what-it-does-not-do)
 4. [How IDM's licensing actually works](#4-how-idms-licensing-actually-works)
-5. [The two patches](#5-the-two-patches)
+5. [The four patches](#5-the-four-patches)
 6. [The function that could NOT be patched](#6-the-function-that-could-not-be-patched)
 7. [The matcher (how it survives updates)](#7-the-matcher-how-it-survives-updates)
 8. [Verification](#8-verification)
@@ -38,8 +38,9 @@ bytes of two function prologues.
 | ASLR | on (`DllCharacteristics 0x8140` — `DYNAMICBASE` + `HIGH_ENTROPY_VA` + `NX_COMPAT`) |
 | sections | 5 — `.text .rdata .data .rsrc .reloc` |
 | sha256 pristine | `E3FC655A335E17A6FDD09A9B315291D0C8863180F0D801E5DD7433C9E56AFBD8` |
-| sha256 patched  | `AF844CB09B2B9FFF1C4FDE5D9B051BE93DB1FB08D54EB92CE33C653F4836FA25` |
-| bytes changed | **9** |
+| sha256 patched  | `FF658CE12E67D813037B68F54FA7DC0F63B7787641CFF8E095D83814E2704547` |
+| bytes written | **53**, across 4 sites |
+| bytes differing | **29** (the rest of the written bytes coincidentally already matched) |
 | companion | `idmBroker.exe` 6.35.9.1 (browser-integration broker — carries no license gates, untouched) |
 
 A different IDM build gets a different hash. That is expected: see
@@ -67,7 +68,17 @@ itself it overwrites `IDMan.exe` with a fresh signed build, the patch is gone, a
 
 - the startup license check reports `status 0` (clean) without ever reading the registry,
   validating a serial, or reaching the phone-home path;
-- the nag/exit gate reports `1` (continue) so the shutdown branch after it is never taken.
+- the nag/exit gate reports `1` (continue) so the shutdown branch after it is never taken;
+
+and corrects the two strings the About dialog prints:
+
+- the version line always reads `… Full` instead of `… Trial`;
+- the licensee line reads `Registered Version` instead of the shipped placeholder
+  `Unregistered Version`.
+
+The last two are **presentational**. They change what is on screen and nothing else — no
+gate, no counter, no global and no code path is affected by them. See
+[§5](#5-the-four-patches).
 
 **Does not:**
 
@@ -162,12 +173,17 @@ analysis. See [§6](#6-the-function-that-could-not-be-patched).
 
 ---
 
-## 5. The two patches
+## 5. The four patches
 
-Both are prologue replacements, written before any stack frame is allocated — so neither
-touches `ESP`, `EBP` or any callee-saved register on the way out. The caller's stack stays
-balanced and the return value lands in `EAX`, which is exactly what the callers read. The
-remainder of each original body becomes dead code behind the `ret` and is never reached.
+Sites 1 and 2 are prologue replacements, written before any stack frame is allocated — so
+neither touches `ESP`, `EBP` or any callee-saved register on the way out. The caller's
+stack stays balanced and the return value lands in `EAX`, which is exactly what the callers
+read. The remainder of each original body becomes dead code behind the `ret` and is never
+reached.
+
+Sites 3 and 4 are not code replacement in that sense: one is a single branch byte, the other
+a UTF-16 string inside a dialog template. Neither allocates a frame, touches a register or
+writes a global.
 
 ### Patch 1 — startup validator
 
@@ -195,20 +211,118 @@ remainder of each original body becomes dead code behind the `ret` and is never 
 | | `mov eax,1; ret` — always reports "continue" |
 | bytes | 6 |
 
-**9 bytes total.** Nothing else in the file differs — no header, no section table, no
-imports, no relocations, no resources.
+### Patch 3 — About dialog, version suffix
+
+The About dialog (`RT_DIALOG` id `100`) builds its version line in
+`CAboutDlg::OnInitDialog` and picks between two literals sitting side by side in `.rdata`:
+
+```asm
+0x0039A1  GetWindowText([esi+0x184], buf, 0x40)   ; control 0x04EE's current text
+          test eax, eax
+          jle  0x003A75                           ; empty -> leave it alone
+
+0x0039C1  CString s1
+0x0039D0  39 1D 24 BD 77 00   cmp dword [0x77BD24], ebx   ; ebx = 0
+0x0039D6  74 07               je   0x0039DF
+0x0039D8  68 50 6E 69 00      push 0x696E50                ; "Trial"
+0x0039DD  EB 05               jmp  0x0039E4
+0x0039DF  68 48 6E 69 00      push 0x696E48                ; "Full"
+0x0039E4  E8 77 F6 FF FF      call 0x3060                  ; CString::operator=
+
+          … CString s2 = s1 + [0x788E50]                   ; the space separator
+          … Format(s3, "%s%s", buf, s2)
+          … SetWindowText([esi+0x184], s3)
+```
+
+`0x77BD24` (disk) is the trial global from [§4](#4-how-idms-licensing-actually-works) — file
+value `1` on every trial build — so the `je` is never taken and the line ends in `Trial`.
+Flipping the branch to `EB` (`jmp`) makes it unconditional and the line always ends in
+`Full`. The `cmp` stays, now dead; nothing else in the sequence changes.
+
+| | |
+|---|---|
+| RVA | `0x0039D6` |
+| **file offset** | **`0x002DD6`** |
+| section | `.text` |
+| original | `74 07` (`je 0x0039DF`) |
+| patched | `EB 07` (`jmp 0x0039DF`) |
+| bytes | 2 |
+
+### Patch 4 — About dialog, licensee line
+
+The same dialog ships the static control `0x049D` — the one under the group box "This
+product is licensed to:" — with a placeholder baked into the resource template:
+
+```
+Unregistered Version        UTF-16, file offset 0x38DB5C, .rsrc
+```
+
+That placeholder is only ever replaced at runtime by one path, and it is gated twice:
+
+```asm
+0x003683  39 1D 24 BD 77 00   cmp dword [0x77BD24], ebx
+0x003689  0F 85 …             jne 0x0039A1             ; trial -> skip the whole read
+          … RegOpenKeyExA(HKLM, "SOFTWARE\Internet Download Manager", …)
+          … RegQueryValueExA(…) x2
+          … if (s.IsEmpty()) jmp 0x0037C7              ; empty -> leave the placeholder
+0x0037C2  E8 …                 call 0x211B14            ; CWnd::SetDlgItemText(0x049D, s)
+```
+
+On a trial build `0x77BD24` is `1`, so the branch is taken and the registry read never
+runs. Even with that branch forced open it would still fail: a trial install has no
+licensee value under `HKLM\SOFTWARE\Internet Download Manager`, the `CString` comes back
+empty, and the `IsEmpty` check skips the `SetDlgItemText`. The placeholder is what stays on
+screen either way.
+
+So the placeholder itself is replaced, in place, in the resource. The dialog parser walks
+from item to item off the string terminator, which is why the replacement has to be exactly
+the same length as the original — 20 UTF-16 characters plus a 2-byte terminator, 42 bytes
+on both sides:
+
+```
+before   U n r e g i s t e r e d   V e r s i o n \0
+after    R e g i s t e r e d   V e r s i o n   _  _ \0
+                                                              ^ ^ trailing spaces
+```
+
+The two trailing spaces are invisible in a left-aligned `STATIC` control, so it renders as
+`Registered Version`.
+
+| | |
+|---|---|
+| RVA | `0x0399F5C` |
+| **file offset** | **`0x38DB5C`** |
+| section | `.rsrc` |
+| original | `55 00 6E 00 … 6E 00 00 00` — `"Unregistered Version"` UTF-16 |
+| patched | `52 00 65 00 … 20 00 00 00` — `"Registered Version  "` UTF-16 |
+| bytes | 42 |
+
+If IDM is ever given a real serial, `0x77BD24` goes to `0` and the registry path above runs
+and overwrites this control with the real licensee name — the patch neither blocks nor
+conflicts with that.
+
+**53 bytes written** (3 + 6 + 2 + 42), of which 29 actually change value. Nothing else in
+the file differs — no header, no section table, no imports, no relocations, and in the
+resources nothing but this one string.
 
 ### Why these signatures are ASLR-proof
 
-Both patches contain **zero absolute addresses**, so they are correct under any slide.
-The *signatures* are also relocation-independent: `lea ebp,[esp-0x424]` and
-`sub esp,0x424` are stack displacements, not addresses.
+All four patches contain **zero absolute addresses**, so they are correct under any slide.
+Sites 1 and 2 patch instructions whose operands are stack displacements; site 3 patches a
+relative short-jump displacement; site 4 patches character codes. None of the four has a
+relocation in it.
 
-The signatures are deliberately cut **before** the `push imm32` that follows the prologue
+For sites 1 and 2, the *signatures* are also relocation-independent:
+`lea ebp,[esp-0x424]` and `sub esp,0x424` are stack displacements, not addresses. Those
+signatures are deliberately cut **before** the `push imm32` that follows the prologue
 (`68 70 52 66 00` = `push 0x665270`, the SEH handler). That immediate *is* an absolute
 address and is relocated by the loader. Note the file always contains the **unrelocated**
 form — relocation happens in memory at load time, so a disk patch is identical on every
 machine for a given build.
+
+Site 3's signature *does* span an immediate — `68 50 6E 69 00` is `push 0x696E50` — but it
+is only read, never written: the patch covers the two branch bytes in front of it, and the
+relocated address is never compared against anything.
 
 ---
 
@@ -248,13 +362,14 @@ reached.
 ## 7. The matcher (how it survives updates)
 
 There are no symbol names in a native binary to re-find after an update. Identity here is a
-**byte signature scanned inside `.text`**, resolved through three tiers:
+**byte signature scanned inside a named section** — `.text` for sites 1–3, `.rsrc` for
+site 4 — resolved through three tiers:
 
 | tier | when | how |
 |---|---|---|
 | `already` | the replacement bytes are already at the known offset | skip, refresh `state.json` |
 | `exact` | file hashes to the known pristine build | signature must be sitting at the known offset, else refuse |
-| `shape` | a different build — signature found **exactly once** in `.text` | patch wherever it landed |
+| `shape` | a different build — signature found **exactly once** in its section | patch wherever it landed |
 | `dark` | signature absent, **or found 2+ times** | refuse, write nothing, exit 4 |
 
 All sites are classified **before anything is written**. One ambiguous site refuses the
@@ -277,12 +392,20 @@ shape-scan on the prologue alone would have picked one of the wrong three and pa
 unrelated function.
 
 The signature is therefore extended to **18 bytes** — one byte into that address — which
-lands exactly once. `nag_exit_gate` was already unique at 13 bytes.
+lands exactly once. `nag_exit_gate` was already unique at 13 bytes. Sites 3 and 4 needed no
+such care: a branch byte surrounded by literal immediates, and a 20-character English
+string, both land exactly once on the first try.
 
 ```
-startup_validator  18 bytes  558dac24dcfbffff81ec240400006aff6870   1 hit
-nag_exit_gate      13 bytes  558dac249cf7ffff81ec640800             1 hit
+startup_validator     18 bytes  558dac24dcfbffff81ec240400006aff6870              [.text]  1 hit
+nag_exit_gate         13 bytes  558dac249cf7ffff81ec640800                        [.text]  1 hit
+about_version_full    14 bytes  740768506E6900EB0568486E6900                     [.text]  1 hit
+about_licensee_text   42 bytes  55006e0072006500670069007300740065007200…          [.rsrc]  1 hit
 ```
+
+Site 4's signature is the string including its terminator. Scanning for the characters
+alone would also match any other dialog that happens to say "Unregistered Version"; the
+terminator plus the `.rsrc` section scope keeps it at one.
 
 Prove it yourself before trusting a new build:
 
@@ -293,6 +416,36 @@ Prove it yourself before trusting a new build:
 `UNIQUE` → the shape tier is safe. `AMBIGUOUS` or `ABSENT` → the engine will refuse, and
 that refusal is the correct answer for a build this analysis does not cover.
 
+### The fast path, and what happens when the engine grows
+
+`state.json` records `lastGoodSha` so a repeat run can confirm "still the binary I
+patched" without re-scanning. That alone is not a safe condition: `patch-now.cmd` does not
+pass `-Force`, and a `state.json` left behind by an **older** engine records the hash of
+*its* patch set. A newer engine carrying extra sites would see that hash match, print
+`already patched`, and exit — never applying the sites it added.
+
+So the fast path requires **both**:
+
+- `state.lastGoodSha` equals the file's current hash, **and**
+- `state.patchedSha` equals the hash *this* engine would produce.
+
+A state written by a different patch set fails the second condition and falls through to a
+full re-scan, where the tiers above resolve each site — `already` for the ones already in
+place, `exact`/`shape` for the new ones. On a 2-site install upgraded to this engine the
+run reports:
+
+```
+[i] state.json is from an older patch set - re-checking all sites
+  startup_validator   already @ 0x04FF40
+  nag_exit_gate       already @ 0x04C2F0
+  about_version_full  shape   @ 0x002DD6
+  about_licensee_text shape   @ 0x38DB5C
+  [ok] 4 sites patched, 53 bytes total
+```
+
+The same guard is what makes an engine *downgrade* safe: an old engine meeting a
+newer-engine state re-checks rather than trusting a hash it cannot reproduce.
+
 ---
 
 ## 8. Verification
@@ -301,12 +454,59 @@ that refusal is the correct answer for a build this analysis does not cover.
 
 ```
 pristine sha256  E3FC655A335E17A6FDD09A9B315291D0C8863180F0D801E5DD7433C9E56AFBD8
-patched  sha256  AF844CB09B2B9FFF1C4FDE5D9B051BE93DB1FB08D54EB92CE33C653F4836FA25
-bytes changed    9   @ 0x04C2F0..0x04C2F5 (6)  and  0x04FF40..0x04FF42 (3)
+patched  sha256  FF658CE12E67D813037B68F54FA7DC0F63B7787641CFF8E095D83814E2704547
 ```
+
+53 bytes are written across the four windows; **29 of them differ** from the original — the
+rest already held the value being written. The full diff, straight out of
+`tools\byte_diff.ps1`:
+
+```
+total differing bytes: 29
+  @0x2DD6    orig=74  patched=EB                        .text   site 3, the branch byte
+  @0x4C2F0   orig=55  patched=B8                        .text   site 2
+  @0x4C2F1   orig=8D  patched=01                        .text   site 2
+  @0x4C2F2   orig=AC  patched=00                        .text   site 2
+  @0x4C2F3   orig=24  patched=00                        .text   site 2
+  @0x4C2F4   orig=9C  patched=00                        .text   site 2
+  @0x4C2F5   orig=F7  patched=C3                        .text   site 2
+  @0x4FF40   orig=55  patched=31                        .text   site 1
+  @0x4FF41   orig=8D  patched=C0                        .text   site 1
+  @0x4FF42   orig=AC  patched=C3                        .text   site 1
+  @0x38DB5C  orig=55  patched=52                        .rsrc   U -> R
+  @0x38DB5E  orig=6E  patched=65                        .rsrc   n -> e
+  @0x38DB60  orig=72  patched=67                        .rsrc   r -> g
+  @0x38DB62  orig=65  patched=69                        .rsrc   e -> i
+  @0x38DB64  orig=67  patched=73                        .rsrc   g -> s
+  @0x38DB66  orig=69  patched=74                        .rsrc   i -> t
+  @0x38DB68  orig=73  patched=65                        .rsrc   s -> e
+  @0x38DB6A  orig=74  patched=72                        .rsrc   t -> r
+  @0x38DB6E  orig=72  patched=64                        .rsrc   r -> d
+  @0x38DB70  orig=65  patched=20                        .rsrc   e -> (space)
+  @0x38DB72  orig=64  patched=56                        .rsrc   d -> V
+  @0x38DB74  orig=20  patched=65                        .rsrc   (space) -> e
+  @0x38DB76  orig=56  patched=72                        .rsrc   V -> r
+  @0x38DB78  orig=65  patched=73                        .rsrc   e -> s
+  @0x38DB7A  orig=72  patched=69                        .rsrc   r -> i
+  @0x38DB7C  orig=73  patched=6F                        .rsrc   s -> o
+  @0x38DB7E  orig=69  patched=6E                        .rsrc   i -> n
+  @0x38DB80  orig=6F  patched=20                        .rsrc   o -> (space)
+  @0x38DB82  orig=6E  patched=20                        .rsrc   n -> (space)
+```
+
+The three gaps in the `.rsrc` run are the characters that stayed put: the `e` at index 8 of
+both strings, and the two UTF-16 high bytes and the terminator that are `00` on both sides.
 
 Every patched byte matches the in-memory PoC that was proven live first — the disk patch is
 that exact patch made permanent.
+
+Reversibility is the strongest form of this proof: writing the four original signatures
+back over the patched image reproduces the pristine sha256 **byte for byte**. The patch
+provably touches nothing outside those four windows.
+
+Applying sites 3 and 4 on top of an already-patched 2-site binary produces the same
+`FF658CE1…` hash as patching all four from pristine, so the transition from an existing
+install is exact.
 
 **Dynamic (Frida, in-memory, before touching the file)**
 
@@ -323,8 +523,8 @@ that exact patch made permanent.
 
 **Matcher**
 
-- `exact`, `shape` (both sites), `already` and `dark` exercised against real and mutated
-  files;
+- `exact`, `shape` (all four sites, across two sections), `already` and `dark` exercised
+  against real and mutated files;
 - idempotent: a second run reports `already patched` and writes nothing;
 - restore: `uninstall.cmd` returns the file to the pristine hash.
 
@@ -365,3 +565,8 @@ State lives in `C:\ProgramData\IdmPatch\`:
   makes the startup check *report* clean. Nothing is added to the registry, nothing is
   sent to any server, and the validator/crypto code is left fully intact and unreachable
   from startup.
+- **The About dialog reads registered; the program does not think it is.** Sites 3 and 4 are
+  display-only, and nothing that inspects actual license state reads what they change:
+  `0x77BD24` still reads `1` on a trial build, `0x95BD28` still reads `30`, and the HKLM
+  licensee value is still absent. Only the two strings the dialog paints are different.
+  Any runtime re-check that compares real state behaves exactly as it did before.
