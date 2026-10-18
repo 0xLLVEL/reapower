@@ -27,6 +27,7 @@ param(
     [string]$StateDir   = 'C:\ProgramData\ServBayPatch',
     [string]$TaskName   = 'ServBay AutoPatch',
     [int]$FallbackHours = 6,
+    [switch]$NoTask,
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -125,31 +126,39 @@ try {
 # which would kill it every three days.
 $settings.ExecutionTimeLimit = 'PT0S'
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigLogon, $trigNet `
-    -Principal $principal -Settings $settings -Force `
-    -Description 'Runs the ServBay patch engine when ServBay.exe starts after an update (event-driven, no polling).' | Out-Null
-Write-Host ("task      -> {0}  (logon + {1}h fallback, RunLevel Highest)" -f $TaskName, $FallbackHours)
+if (-not $NoTask) {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigLogon, $trigNet `
+        -Principal $principal -Settings $settings -Force `
+        -Description 'Runs the ServBay patch engine when ServBay.exe starts after an update (event-driven, no polling).' | Out-Null
+    Write-Host ("task      -> {0}  (logon + {1}h fallback, RunLevel Highest)" -f $TaskName, $FallbackHours)
+}
 
 Write-Host ''
 Write-Host '--- first run (patches now, restarts ServBay if it was running) ---'
 & $engine
 
-Write-Host ''
-Write-Host '--- watcher ---'
-Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 4
-$watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*ServBayAutoPatchWatch.ps1*' })
-if ($watchProc.Count) {
-    Write-Host ("running   -> pid {0}, blocked on the process-start trace" -f (($watchProc | ForEach-Object { $_.ProcessId }) -join ', ')) -ForegroundColor Green
-} else {
-    Write-Host 'running   -> not up yet; check the log below' -ForegroundColor Yellow
-}
+if (-not $NoTask) {
+    Write-Host ''
+    Write-Host '--- watcher ---'
+    Start-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Seconds 4
+    $watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*ServBayAutoPatchWatch.ps1*' })
+    if ($watchProc.Count) {
+        Write-Host ("running   -> pid {0}, blocked on the process-start trace" -f (($watchProc | ForEach-Object { $_.ProcessId }) -join ', ')) -ForegroundColor Green
+    } else {
+        Write-Host 'running   -> not up yet; check the log below' -ForegroundColor Yellow
+    }
 
-Write-Host ''
-Write-Host '--- status ---'
-$t = Get-ScheduledTask -TaskName $TaskName
-Write-Host ("task      -> {0}  [{1}]" -f $t.TaskName, $t.State)
+    Write-Host ''
+    Write-Host '--- status ---'
+    $t = Get-ScheduledTask -TaskName $TaskName
+    Write-Host ("task      -> {0}  [{1}]" -f $t.TaskName, $t.State)
+}
 Write-Host ("log       : {0}\watch.log  (watcher),  {0}\autopatch.log  (engine)" -f $StateDir)
 Write-Host ("rollback  : {0}\backup\*.dll  (copy over C:\ServBay\app\ServBay.dll)" -f $StateDir)
-Write-Host  'remove    : uninstall.cmd'
+if ($NoTask) {
+    Write-Host 'mode      : MANUAL - no watcher, no task. Re-run this installer (or ServBayAutoPatch.ps1) after each ServBay update.'
+} else {
+    Write-Host 'remove    : uninstall.cmd'
+}

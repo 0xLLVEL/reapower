@@ -560,3 +560,30 @@ table contains plenty of ways to break an app by guessing.
 *Analysis and patching performed against a locally installed copy. Line numbers, tokens,
 RVAs and hashes are all from build 1.34.4.2610; only the semantic names of the seven gates
 and the two label strings are expected to survive into future builds.*
+
+---
+
+## Manual mode (no watcher, no task)
+
+If you do not want a resident watcher or a scheduled task, install with `-NoTask`:
+
+```powershell
+# ServBay
+.\Install-ServBayAutoPatch.ps1 -NoTask
+
+# TablePlus
+.\Install-TablePlusPatch.ps1 -NoTask
+```
+
+This patches the binary **once** and registers nothing: no watcher process, no scheduled
+task, no auto-reapply. When the app updates and replaces its binary, re-patch manually:
+
+```powershell
+# ServBay  (or double-click patch-now.cmd)
+C:\ProgramData\ServBayPatch\ServBayAutoPatch.ps1
+
+# TablePlus  (or double-click patch-now.cmd)
+C:\ProgramData\TablePlusPatch\TablePlusPatch.ps1
+```
+
+Use this when you prefer explicit control over automatic re-patching.
