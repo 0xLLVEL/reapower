@@ -24,6 +24,7 @@ change what the About dialog prints.
 8. [Verification](#8-verification)
 9. [Exit codes](#9-exit-codes)
 10. [Limits](#10-limits)
+11. [The serial algorithm and the keygen](#11-the-serial-algorithm-and-the-keygen)
 
 ---
 
@@ -90,9 +91,11 @@ gate, no counter, no global and no code path is affected by them. See
 - **Emulate a serial.** No serial is written anywhere — not to
   `HKCU\Software\DownloadManager`, not to the file. The registry on a fresh install carries
   no serial values, and this patch does not add any.
-- **Patch the serial validator or its crypto.** The format check (`0x702910`: length `0x17`,
-  dashes at fixed positions) and the serial crypto (`0x760790`) are left exactly as shipped.
-  The gates *around* them are cut, the code inside them is untouched.
+- **Patch the serial validator or its crypto.** The registration dialog's validator
+  (`0x702910`: length `0x17`, dashes at fixed positions, then four block checks) and the
+  block decoder it uses (`0x7018F0`) are left exactly as shipped. The gates *around* them
+  are cut, the code inside them is untouched — [§11](#11-the-serial-algorithm-and-the-keygen)
+  documents them without changing them.
 - **Touch the trial-length selector or the day counters.** See [§4](#4-how-idms-licensing-actually-works).
 - **Modify, disable or intercept any network call.** The phone-home path is not patched,
   not stubbed, not redirected. Update traffic and normal operation are untouched.
@@ -112,8 +115,8 @@ Frida in-memory instrumentation of a live instance.
 InitInstance 0x632070
   └─ call 0x630B40                 startup license check
        ├─ reads HKCU\Software\DownloadManager
-       ├─ format-validates any serial found  (0x702910)
-       ├─ runs serial crypto                 (0x760790)
+       ├─ format-validates any serial found  (inline: 0x630DE9 / 0x630DF7 / 0x630E00)
+       ├─ runs NO block decode or crypto     (§11 — the decoder's only callers are in the dialog)
        └─ returns a status code 0..12
   └─ jump table 0x6339CC            one branch per status
        └─ status 0 ─► 0x6331C6
@@ -658,3 +661,121 @@ State lives in `C:\ProgramData\IdmPatch\`:
   cut, so nothing downstream can act on it. The check is not "passed" — it is ignored, which
   is the same thing the patch does to the startup gates and for the same reason: the value is
   only ever consumed by a branch, and the branch is the thing being patched.
+
+---
+
+## 11. The serial algorithm and the keygen
+
+The five patches make the license gates irrelevant. This section is the other half of the
+picture — what those gates actually read — plus a generator for the thing they read.
+
+Everything below is stated as **RVA**, which is stable. The runtime addresses used in §3
+and §4 are RVA + `0x5E0000`, the base the binary sat at during that measurement, so
+`0x702910` is RVA `0x122910` and `0x7018F0` is RVA `0x1218F0`. File offset inside `.text`
+is RVA − `0x0C00`.
+
+### Format
+
+`XXXXX-XXXXX-XXXXX-XXXXX` — 23 characters, `-` at indices 5, 11 and 17.
+
+The startup check tests exactly `strlen == 0x17` and those three bytes
+(`0x050DE9`–`0x050E07`, file `0x04F1E9`) and, on success, writes `0` to `0x77BD24`
+(`0x050E09`, file `0x04F209`). Nothing else happens there — no decode, no arithmetic. The
+registration dialog uppercases its field first (`0x243811`, `a-z` → `A-Z`), so case never
+matters either way.
+
+### The alphabet — RVA `0x122954`
+
+Thirty-six glyphs written one byte at a time by the dialog, then read by the decoder
+through `[eax + 0x789868]` at `0x121907`. A shuffled `0-9 A-Z`:
+
+```
+index  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+glyph  2  Y  O  P  B  3  A  Q  C  V  U  X  M  N  R  S  9  7  W  E  0  I  Z  D
+
+index 24 25 26 27 28 29 30 31 32 33 34 35
+glyph  4  K  L  F  G  H  J  8  1  6  5  T
+```
+
+### Block decode — RVA `0x1218F0`, file `0x120CF0`
+
+```asm
+*out = 0
+for ecx = 0..4:
+    dl = block[ecx]
+    find dl in charset[0 .. 0x24) -> eax;  not found -> return 0
+    *out = *out * 0x25 + eax               ; 0x25 = 37
+```
+
+Base **37** against a 36-glyph alphabet, so a base-37 digit of `36` is unencodable. The
+largest representable block is therefore
+`35 * (37^4 + 37^3 + 37^2 + 37 + 1)` = **67,417,735**.
+
+### The four constraints — RVA `0x122E24`, file `0x122224`
+
+| block | serial span | decoded into | required |
+|---|---|---|---|
+| 0 | 0–4 | `[ebp-0x30]` | `% 43 == 0` **and** `!= 0` |
+| 1 | 6–10 | `[ebp-0x1c]` | `% 23 == 0` **and** `!= 0` |
+| 2 | 12–16 | `[ebp-0x14]` | `% 17 == 0` **and** `!= 0` |
+| 3 | 18–22 | `[ebp-0x44]` | `% 53 == 0` **and** `!= 0` |
+
+The four memcpys that cut the spans sit at `0x122D3C`–`0x122D8B` (`+0`, `+6`, `+0xC`,
+`+0x12`, five bytes each, NUL-terminated), the four decodes at `0x122DB7`, `0x122DD0`,
+`0x122DE9`, `0x122E02`. Each test is a signed division — magic multipliers `0x2FA0BE83`,
+`0xB21642C9`, `0x78787879`, `0x4D4873ED` with the shifts their quotients need — the
+remainder compared against zero, and the zero-value case checked separately. Any failure
+raises `bl`, and `bl` together with the format decides the dialog:
+
+```
+You have entered incorrect Serial Number.
+```
+
+That is the entire check. **No public key, no signature, no hash, no server, no license
+file.** A generator is arithmetic, not crypto. The decoder's four call sites are all inside
+the dialog; the format-check function `0x121E10` has two callers (`0x122560`, `0x12275A`),
+neither on the startup path. That is also what makes §10's claim precise: the validator
+code sits intact in the file and is unreachable from startup.
+
+### `tools\idm_keygen.ps1`
+
+Zero-dependency PowerShell, like everything else here.
+
+```powershell
+.\tools\idm_keygen.ps1                              # five serials
+.\tools\idm_keygen.ps1 -Count 1                     # one serial
+.\tools\idm_keygen.ps1 -Validate XXXXX-XXXXX-XXXXX-XXXXX   # audit any serial
+.\tools\idm_keygen.ps1 -SelfTest                    # reference vectors + 500 round-trips
+```
+
+Generation draws five glyphs per block, keeps only values satisfying that block's modulus,
+and re-runs the full validator on its own output before printing — a serial that does not
+round-trip throws instead of being emitted. It writes nothing, anywhere: no registry, no
+file, no process. `IDM`'s own dialog is what persists a serial, and the startup check then
+finds a format-valid value on every launch.
+
+```
+$ .\tools\idm_keygen.ps1 -Count 3
+DF7D7-ESWZ9-5T0P3-CNY0T
+Z2CCS-YND5O-YCJTC-46YA5
+IC0GW-VKBE1-RMG0S-W837N
+
+$ .\tools\idm_keygen.ps1 -Validate 222YA-2222D-22227-222Y9
+  format    23 chars, dashes at 5/11/17      OK
+  block 0   222YA  ->        43  %43 == 0  OK
+  block 1   2222D  ->        23  %23 == 0  OK
+  block 2   22227  ->        17  %17 == 0  OK
+  block 3   222Y9  ->        53  %53 == 0  OK
+  result    VALID  222YA-2222D-22227-222Y9
+```
+
+**Verification.** `-SelfTest` runs eight reference vectors — two valid, six single-fault:
+bad modulus, zero block, out-of-alphabet glyph, missing dash, wrong length, and
+case/whitespace tolerance — plus 500 generated round-trips, and reports `selftest 9/9
+passed`. The same vectors and 60 freshly generated serials were then checked against a
+second implementation written independently from the same disassembly: two
+implementations, one set of bytes, zero disagreements.
+
+What has **not** been done is typing a generated serial into a live IDM dialog — that step
+is yours. Hand-built check vector if you want to verify the reasoning rather than the tool:
+`222YA-2222D-22227-222Y9` decodes to exactly `43`, `23`, `17`, `53`.
