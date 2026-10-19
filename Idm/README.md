@@ -6,8 +6,9 @@ genuine" dialog — IDMan.exe starts as if the check came back clean.
 
 Everything here operates on your own installation, on disk, with no network calls and no
 license server interaction. It is an analysis of a shipped native binary and a byte-level
-patch of it: **29 bytes of 6,201,712 actually differ**, written across four sites — two that
-neutralise the license gates, two that change what the About dialog prints.
+patch of it: **31 bytes of 6,201,712 actually differ**, written across five sites — two that
+neutralise the license gates, one that silences the download-time self-check dialog, two that
+change what the About dialog prints.
 
 ---
 
@@ -17,7 +18,7 @@ neutralise the license gates, two that change what the About dialog prints.
 2. [TL;DR — install](#2-tldr--install)
 3. [What it does / what it does NOT do](#3-what-it-does--what-it-does-not-do)
 4. [How IDM's licensing actually works](#4-how-idms-licensing-actually-works)
-5. [The four patches](#5-the-four-patches)
+5. [The five patches](#5-the-five-patches)
 6. [The function that could NOT be patched](#6-the-function-that-could-not-be-patched)
 7. [The matcher (how it survives updates)](#7-the-matcher-how-it-survives-updates)
 8. [Verification](#8-verification)
@@ -38,9 +39,9 @@ neutralise the license gates, two that change what the About dialog prints.
 | ASLR | on (`DllCharacteristics 0x8140` — `DYNAMICBASE` + `HIGH_ENTROPY_VA` + `NX_COMPAT`) |
 | sections | 5 — `.text .rdata .data .rsrc .reloc` |
 | sha256 pristine | `E3FC655A335E17A6FDD09A9B315291D0C8863180F0D801E5DD7433C9E56AFBD8` |
-| sha256 patched  | `FF658CE12E67D813037B68F54FA7DC0F63B7787641CFF8E095D83814E2704547` |
-| bytes written | **53**, across 4 sites |
-| bytes differing | **29** (the rest of the written bytes coincidentally already matched) |
+| sha256 patched  | `3406A8105779F5BFAE41A05A2349306FBBCE2D8546CF3DC83F63AA9256B4CABD` |
+| bytes written | **55**, across 5 sites |
+| bytes differing | **31** (the rest of the written bytes coincidentally already matched) |
 | companion | `idmBroker.exe` 6.35.9.1 (browser-integration broker — carries no license gates, untouched) |
 
 A different IDM build gets a different hash. That is expected: see
@@ -64,11 +65,15 @@ itself it overwrites `IDMan.exe` with a fresh signed build, the patch is gone, a
 
 ## 3. What it does / what it does NOT do
 
-**Does** — forces the two functions that decide *whether to continue* to continue:
+**Does** — forces the functions that decide *whether to continue* to continue:
 
 - the startup license check reports `status 0` (clean) without ever reading the registry,
   validating a serial, or reaching the phone-home path;
 - the nag/exit gate reports `1` (continue) so the shutdown branch after it is never taken;
+- the download path skips the self-check test that raises
+  **"The main IDM executive file is damaged."** — that dialog is IDM reacting to the modified
+  `IDMan.exe` itself, it appears at download time rather than at startup, and the gate in
+  front of it is now unreachable ([§5, patch 5](#patch-5--download-time-self-check-gate));
 
 and corrects the two strings the About dialog prints:
 
@@ -78,7 +83,7 @@ and corrects the two strings the About dialog prints:
 
 The last two are **presentational**. They change what is on screen and nothing else — no
 gate, no counter, no global and no code path is affected by them. See
-[§5](#5-the-four-patches).
+[§5](#5-the-five-patches).
 
 **Does not:**
 
@@ -173,7 +178,7 @@ analysis. See [§6](#6-the-function-that-could-not-be-patched).
 
 ---
 
-## 5. The four patches
+## 5. The five patches
 
 Sites 1 and 2 are prologue replacements, written before any stack frame is allocated — so
 neither touches `ESP`, `EBP` or any callee-saved register on the way out. The caller's
@@ -181,8 +186,8 @@ stack stays balanced and the return value lands in `EAX`, which is exactly what 
 read. The remainder of each original body becomes dead code behind the `ret` and is never
 reached.
 
-Sites 3 and 4 are not code replacement in that sense: one is a single branch byte, the other
-a UTF-16 string inside a dialog template. Neither allocates a frame, touches a register or
+Sites 3, 4 and 5 are not code replacement in that sense: two are single branch bytes, one is
+a UTF-16 string inside a dialog template. None allocates a frame, touches a register or
 writes a global.
 
 ### Patch 1 — startup validator
@@ -301,15 +306,79 @@ If IDM is ever given a real serial, `0x77BD24` goes to `0` and the registry path
 and overwrites this control with the real licensee name — the patch neither blocks nor
 conflicts with that.
 
-**53 bytes written** (3 + 6 + 2 + 42), of which 29 actually change value. Nothing else in
+### Patch 5 — download-time self-check gate
+
+This one is not a license gate. It is IDM checking **itself**, and it fires while a download
+is running rather than at startup — which is why launching the patched build and enumerating
+its windows never shows it:
+
+```
+The main IDM executive file is damaged.
+To continue downloading, please download the latest version of IDM …
+Or, wait a few seconds for the "Continue Download" button to become available.
+[Continue downloading (13)]                      [Open IDM site]
+```
+
+Nothing in `IDMan.exe` carries that sentence as plaintext: the whole dialog string block is
+XOR-obfuscated with the single byte `0x3D` and lives in `.data` from rva `0x37C5CC`
+(`"The main IDM executive file is damaged"`, `"Continue downloading"`, `"Open IDM site"` …),
+which is why a plain string search reports it absent. The reference that decodes it is a
+`push 0x77C5CC` in the dispatch block at rva `0xA8D60`.
+
+The dispatch block itself is one function with one job. `0xA8AE0` reads a language selector
+from `.data` and jumps through table `0x4A8DB0`; **all fifteen cases push the same six
+strings in a different language** — English, Russian, Chinese, Italian, German, Spanish,
+French, Polish, Korean, Vietnamese, Arabic, Thai, Portuguese, Turkish, Indonesian. There is
+no other message in the table, and `0xA8690`, the routine that actually opens the dialog, is
+called from nowhere else in the binary. The countdown lives in its caller, `0xA8E20`, which
+seeds `[0x7894E0]`/`[0x7894E4]` with 20/30/60 seconds.
+
+That caller has exactly one caller, and the gate in front of it is three instructions:
+
+```asm
+0x09BB6F  F6 86 84 00 00 00 08   test byte ptr [esi+0x84], 8
+0x09BB76  75 16                   jne  0x9BB8E              ; per-download flag -> skip
+0x09BB78  83 3D A0 93 78 00 00    cmp  dword ptr [0x7893A0], 0   ; ← THE TEST
+0x09BB7F  74 0D                   je   0x9BB8E              ; clean -> continue
+0x09BB81  E8 9A D2 00 00          call 0xA8E20              ; raise the dialog
+0x09BB86  85 C0                   test eax, eax
+0x09BB88  0F 84 0F 01 00 00       je   0x9BC9D              ; "Open IDM site" -> bail out
+0x09BB8E  …                       ; ← the normal continue path
+```
+
+`0x7893A0` is the self-check flag, and its whole life in this binary is two instructions:
+one **writer** — `0x9A5F0`, a single arm of the runtime dispatcher doing
+`mov eax,1; mov [0x7893A0],eax` — and one **reader**, the `cmp` above. `.text` contains no
+other reference to the address. So the flag does exactly one thing in the entire program:
+make this dialog appear.
+
+Replacing the `cmp`+`je` pair with `EB 14` (`jmp 0x9BB8E`) sends the download down precisely
+the path a clean flag already takes. The dialog keeps every one of its strings, its
+countdown and its fifteen languages — it just has no way in from anywhere.
+
+| | |
+|---|---|
+| RVA | `0x09BB78` |
+| **file offset** | **`0x09AF78`** |
+| section | `.text` |
+| original | `83 3D A0 93 78 00 00 74 0D` |
+| | `cmp dword [0x7893A0],0 ; je 0x9BB8E` |
+| patched | `EB 14` (`jmp 0x9BB8E`) — the remaining 7 bytes become unreachable |
+| bytes | 2 |
+
+The call, the `test`/`je` pair and everything behind them are dead after the patch; no
+register, no flag-register consumer and no stack slot is involved, because the instruction
+that lands at `0x9BB8E` in the untaken case (`mov ecx,[esi+0x84]`) reads memory, not flags.
+
+**55 bytes written** (3 + 6 + 2 + 42 + 2), of which 31 actually change value. Nothing else in
 the file differs — no header, no section table, no imports, no relocations, and in the
 resources nothing but this one string.
 
 ### Why these signatures are ASLR-proof
 
-All four patches contain **zero absolute addresses**, so they are correct under any slide.
-Sites 1 and 2 patch instructions whose operands are stack displacements; site 3 patches a
-relative short-jump displacement; site 4 patches character codes. None of the four has a
+All five patches contain **zero absolute addresses**, so they are correct under any slide.
+Sites 1 and 2 patch instructions whose operands are stack displacements; sites 3 and 5 patch
+relative short-jump displacements; site 4 patches character codes. None of the five has a
 relocation in it.
 
 For sites 1 and 2, the *signatures* are also relocation-independent:
@@ -323,6 +392,12 @@ machine for a given build.
 Site 3's signature *does* span an immediate — `68 50 6E 69 00` is `push 0x696E50` — but it
 is only read, never written: the patch covers the two branch bytes in front of it, and the
 relocated address is never compared against anything.
+
+Site 5's signature is `83 3D A0 93 78 00 00 74 0D` — the flag's unrelocated disk address and
+a short-jump byte. It deliberately stops **before** the `call 0xA8E20` that follows, because
+that operand is a `rel32`, a distance between two code locations, which moves whenever
+either side is recompiled. The nine bytes actually used contain no relative call, no
+relocated immediate, and nothing that changes under a different slide.
 
 ---
 
@@ -362,7 +437,7 @@ reached.
 ## 7. The matcher (how it survives updates)
 
 There are no symbol names in a native binary to re-find after an update. Identity here is a
-**byte signature scanned inside a named section** — `.text` for sites 1–3, `.rsrc` for
+**byte signature scanned inside a named section** — `.text` for sites 1–3 and 5, `.rsrc` for
 site 4 — resolved through three tiers:
 
 | tier | when | how |
@@ -392,16 +467,22 @@ shape-scan on the prologue alone would have picked one of the wrong three and pa
 unrelated function.
 
 The signature is therefore extended to **18 bytes** — one byte into that address — which
-lands exactly once. `nag_exit_gate` was already unique at 13 bytes. Sites 3 and 4 needed no
-such care: a branch byte surrounded by literal immediates, and a 20-character English
-string, both land exactly once on the first try.
+lands exactly once. `nag_exit_gate` was already unique at 13 bytes. Sites 3, 4 and 5 needed
+no such care: a branch byte surrounded by literal immediates, a 20-character English string,
+and the damage flag's address plus a short-jump byte, all land exactly once on the first try.
 
 ```
 startup_validator     18 bytes  558dac24dcfbffff81ec240400006aff6870              [.text]  1 hit
 nag_exit_gate         13 bytes  558dac249cf7ffff81ec640800                        [.text]  1 hit
 about_version_full    14 bytes  740768506E6900EB0568486E6900                     [.text]  1 hit
 about_licensee_text   42 bytes  55006e0072006500670069007300740065007200…          [.rsrc]  1 hit
+damaged_dialog_gate    9 bytes  833DA093780000740D                               [.text]  1 hit
 ```
+
+Nine bytes is enough because the sequence they describe does not occur anywhere else: a
+`cmp dword` against one specific global followed by a two-byte short jump. Shorter prefixes
+of the same signature still land once in `.text`, so the shape tier degrades to a narrower
+match rather than to ambiguity.
 
 Site 4's signature is the string including its terminator. Scanning for the characters
 alone would also match any other dialog that happens to say "Unregistered Version"; the
@@ -431,16 +512,16 @@ So the fast path requires **both**:
 
 A state written by a different patch set fails the second condition and falls through to a
 full re-scan, where the tiers above resolve each site — `already` for the ones already in
-place, `exact`/`shape` for the new ones. On a 2-site install upgraded to this engine the
-run reports:
+place, `exact`/`shape` for the new ones. A 4-site install meeting this engine reports:
 
 ```
 [i] state.json is from an older patch set - re-checking all sites
   startup_validator   already @ 0x04FF40
   nag_exit_gate       already @ 0x04C2F0
-  about_version_full  shape   @ 0x002DD6
-  about_licensee_text shape   @ 0x38DB5C
-  [ok] 4 sites patched, 53 bytes total
+  about_version_full  already @ 0x002DD6
+  about_licensee_text already @ 0x38DB5C
+  damaged_dialog_gate shape   @ 0x09AF78
+  [ok] 5 sites patched, 55 bytes total
 ```
 
 The same guard is what makes an engine *downgrade* safe: an old engine meeting a
@@ -454,15 +535,15 @@ newer-engine state re-checks rather than trusting a hash it cannot reproduce.
 
 ```
 pristine sha256  E3FC655A335E17A6FDD09A9B315291D0C8863180F0D801E5DD7433C9E56AFBD8
-patched  sha256  FF658CE12E67D813037B68F54FA7DC0F63B7787641CFF8E095D83814E2704547
+patched  sha256  3406A8105779F5BFAE41A05A2349306FBBCE2D8546CF3DC83F63AA9256B4CABD
 ```
 
-53 bytes are written across the four windows; **29 of them differ** from the original — the
+55 bytes are written across the five windows; **31 of them differ** from the original — the
 rest already held the value being written. The full diff, straight out of
 `tools\byte_diff.ps1`:
 
 ```
-total differing bytes: 29
+total differing bytes: 31
   @0x2DD6    orig=74  patched=EB                        .text   site 3, the branch byte
   @0x4C2F0   orig=55  patched=B8                        .text   site 2
   @0x4C2F1   orig=8D  patched=01                        .text   site 2
@@ -492,6 +573,8 @@ total differing bytes: 29
   @0x38DB7E  orig=69  patched=6E                        .rsrc   i -> n
   @0x38DB80  orig=6F  patched=20                        .rsrc   o -> (space)
   @0x38DB82  orig=6E  patched=20                        .rsrc   n -> (space)
+  @0x9AF78   orig=83  patched=EB                        .text   site 5, cmp -> jmp
+  @0x9AF79   orig=3D  patched=14                        .text   site 5, displacement
 ```
 
 The three gaps in the `.rsrc` run are the characters that stayed put: the `e` at index 8 of
@@ -500,12 +583,12 @@ both strings, and the two UTF-16 high bytes and the terminator that are `00` on 
 Every patched byte matches the in-memory PoC that was proven live first — the disk patch is
 that exact patch made permanent.
 
-Reversibility is the strongest form of this proof: writing the four original signatures
+Reversibility is the strongest form of this proof: writing the five original signatures
 back over the patched image reproduces the pristine sha256 **byte for byte**. The patch
-provably touches nothing outside those four windows.
+provably touches nothing outside those five windows.
 
-Applying sites 3 and 4 on top of an already-patched 2-site binary produces the same
-`FF658CE1…` hash as patching all four from pristine, so the transition from an existing
+Applying sites 3, 4 and 5 on top of an already-patched 2-site binary produces the same
+`3406A810…` hash as patching all five from pristine, so the transition from an existing
 install is exact.
 
 **Dynamic (Frida, in-memory, before touching the file)**
@@ -523,7 +606,7 @@ install is exact.
 
 **Matcher**
 
-- `exact`, `shape` (all four sites, across two sections), `already` and `dark` exercised
+- `exact`, `shape` (all five sites, across two sections), `already` and `dark` exercised
   against real and mutated files;
 - idempotent: a second run reports `already patched` and writes nothing;
 - restore: `uninstall.cmd` returns the file to the pristine hash.
@@ -570,3 +653,8 @@ State lives in `C:\ProgramData\IdmPatch\`:
   `0x77BD24` still reads `1` on a trial build, `0x95BD28` still reads `30`, and the HKLM
   licensee value is still absent. Only the two strings the dialog paints are different.
   Any runtime re-check that compares real state behaves exactly as it did before.
+- **Site 5 removes the dialog, not the self-check behind it.** IDM still computes whatever
+  it computes and still writes `0x7893A0` at `0x9A5F0`; only that flag's single reader is
+  cut, so nothing downstream can act on it. The check is not "passed" — it is ignored, which
+  is the same thing the patch does to the startup gates and for the same reason: the value is
+  only ever consumed by a branch, and the branch is the thing being patched.

@@ -1,13 +1,15 @@
 # Internet Download Manager - License Gate Patch (Windows x86)
 #
-# Patches IDMan.exe in place. Fifty-three bytes across four sites, nothing
+# Patches IDMan.exe in place. Fifty-five bytes across five sites, nothing
 # else: the section table, every other section, the imports, the relocations
 # and the rest of the resources are left exactly as shipped.
 #
-# Sites 1 and 2 neutralise the enforcement gates. Sites 3 and 4 are
-# presentational only - they change what the About dialog says, not what the
-# program does. All four read the trial global 0x77BD24; none of them write
-# it, and no state that gates a download is touched.
+# Sites 1 and 2 neutralise the licence enforcement gates. Site 5 neutralises
+# the self-integrity dialog "The main IDM executive file is damaged" that IDM
+# raises on the download path. Sites 3 and 4 are presentational only - they
+# change what the About dialog says, not what the program does. Sites 1-3
+# read the trial global 0x77BD24; none of them write it, and no state that
+# gates a download is touched.
 #
 #   1) startup validator  (file 0x04FF40, .text, 3 bytes)
 #        original prologue: 55 8D AC 24 DC FB FF FF 81 EC 24 04 00 00 ...
@@ -38,14 +40,33 @@
 #        walks item boundaries off the string terminator, which is why the
 #        replacement has to be exactly as long as what it replaces.
 #
+#   5) damaged-file dialog gate (file 0x09AF78, .text, 2 bytes)
+#        The download path tests IDM's own self-check flag right before it
+#        starts pulling bytes:
+#
+#            83 3D A0 93 78 00 00   cmp dword [0x7893A0], 0   ; damage flag
+#            74 0D                  je   -> continue the download
+#            E8 9A D2 00 00         call 0xA8E20               ; raise the dialog
+#
+#        0xA8E20 is the dialog itself: it counts down the "Continue
+#        downloading (n)" button and then dispatches on the current language
+#        through jump table 0x4A8DB0 - all fifteen cases are the same
+#        "main IDM executive file is damaged" message in fifteen languages.
+#        The flag it tests has exactly one writer (0x9A5F0: mov eax,1;
+#        mov [0x7893A0],eax - one arm of the runtime dispatcher) and exactly
+#        one reader, this cmp. Replacing the test with `EB 14`
+#        (jmp -> 0x9BB8E) puts the download on the same path a clean flag
+#        would have taken, so the dialog has no way in from anywhere.
+#
 # Sites 1 and 2 are replaced at the prologue, before any stack frame is
 # allocated, so neither touches ESP, EBP or any callee-saved register on the
 # way out. The caller's stack stays balanced and the return value lands in
 # EAX, which is exactly what the callers read. The rest of each original body
-# becomes dead code behind the ret and is never reached. Sites 3 and 4 change
-# one branch and one string: no register, no stack slot, no global.
+# becomes dead code behind the ret and is never reached. Sites 3 and 5 change
+# one branch each and site 4 changes one string: no register, no stack slot,
+# no global, no flag.
 #
-# Writing the four original signatures back over a patched file reproduces the
+# Writing the five original signatures back over a patched file reproduces the
 # pristine sha256 byte for byte - the patch provably touches nothing else.
 #
 # Exit codes:
@@ -77,7 +98,7 @@ $Script:ExitDark     = 4
 $Script:ExitVerify   = 5
 
 $Script:PristineSha = 'E3FC655A335E17A6FDD09A9B315291D0C8863180F0D801E5DD7433C9E56AFBD8'
-$Script:PatchedSha  = 'FF658CE12E67D813037B68F54FA7DC0F63B7787641CFF8E095D83814E2704547'
+$Script:PatchedSha  = '3406A8105779F5BFAE41A05A2349306FBBCE2D8546CF3DC83F63AA9256B4CABD'
 
 if (-not $Target) {
     $Target = Join-Path ${env:ProgramFiles(x86)} 'Internet Download Manager\IDMan.exe'
@@ -96,9 +117,11 @@ if (-not $StateDir) {
 # Sig is deliberately cut before the SEH handler's `push imm32` on sites 1 and
 # 2: that immediate is an absolute address, relocated by the loader, so it is
 # the one part of the prologue that is not a stable cross-build identity. Disk
-# bytes are the unrelocated form and are identical on every machine for a
-# given build. Sites 3 and 4 are literal data - a branch byte and a UTF-16
-# string - so neither has a relocation in it either.
+# bytes are the unrelocated form and are identical on every machine for a given
+# build. Sites 3 and 4 are literal data - a branch byte and a UTF-16 string -
+# so neither has a relocation in it either. Site 5's signature is the damage
+# flag's absolute address plus a short-jump byte: no relative call, no
+# relocated immediate, nothing that moves when the surrounding code does.
 $Sites = @(
     [pscustomobject]@{
         Name    = 'startup_validator'
@@ -139,6 +162,19 @@ $Sites = @(
         # replacement must be exactly the length of the original.
         Sig     = '55006e0072006500670069007300740065007200650064002000560065007200730069006f006e000000'
         Patch   = '52006500670069007300740065007200650064002000560065007200730069006f006e00200020000000'
+    },
+    [pscustomobject]@{
+        Name    = 'damaged_dialog_gate'
+        Label   = 'download self-check gate -> skip the "damaged file" dialog'
+        Offset  = 0x09AF78
+        Section = '.text'
+        #   83 3D A0 93 78 00 00   cmp dword [0x7893A0], 0   ; self-check flag
+        #   74 0D                  je   -> continue the download
+        #   E8 9A D2 00 00         call 0xA8E20               ; raise the dialog
+        # The cmp is the flag's only reader; EB 14 jumps straight past the
+        # call to the same continue-path a clean flag already took.
+        Sig     = '833DA093780000740D'
+        Patch   = 'EB14'
     }
 )
 
