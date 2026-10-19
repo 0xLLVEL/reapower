@@ -1,14 +1,21 @@
-# Lunar Client — Integrity Gate Unlock (makes `app.asar` editable)
+# Lunar Client — Integrity Gate + Ownership Gate Unlock
 
 Local patcher for the **Lunar Client launcher** (Moonsworth LLC, `lunarclient` **3.7.25-ow**,
-Electron **42.7.1**). It removes the launcher's self-integrity gate: the Electron
-*asar-integrity* fuse is blown off and the Overwolf `owepm` validator stops being able to
-block startup, so `resources\app.asar` can be edited without the launcher refusing to run.
+Electron **42.7.1**). Two stages, both shipped:
+
+* **Stage 1** removes the launcher's self-integrity gate: Electron's *asar-integrity* fuse is
+  blown off and the Overwolf `owepm` validator can no longer block startup, so
+  `resources\app.asar` becomes editable.
+* **Stage 2** removes the launcher's Minecraft-ownership gate: two length-preserving edits
+  inside `app.asar\dist-electron\electron\main.js` plus one fake entry in
+  `accounts.json`. The launcher then starts as an account that does not exist, shows
+  `LAUNCH GAME`, and reaches the end of its auth pipeline.
 
 Everything here operates on your own installation, on disk, with no network calls.
-It is an analysis of a shipped native binary and a byte-level patch of it:
-**8 bytes of 235,252,216 actually differ**, written across three logical sites —
-one Electron fuse byte and seven JavaScript flag bytes inside the embedded validator.
+It is an analysis of a shipped native/JS binary and a byte-level patch of it:
+**8 bytes of the 235,252,216-byte exe differ**, and **432 bytes inside the 5,754,280-byte
+`main.js` differ while its total length stays exactly the same** — which is why the asar
+header never has to be rebuilt.
 
 ---
 
@@ -18,10 +25,10 @@ one Electron fuse byte and seven JavaScript flag bytes inside the embedded valid
 2. [TL;DR — usage](#2-tldr--usage)
 3. [What it does / what it does NOT do](#3-what-it-does--what-it-does-not-do)
 4. [How Lunar's integrity gate actually works](#4-how-lunars-integrity-gate-actually-works)
-5. [The eight bytes](#5-the-eight-bytes)
+5. [The patches](#5-the-patches)
 6. [Verification](#6-verification)
 7. [Limits](#7-limits)
-8. [Stage 2 — the Minecraft ownership gate (not shipped yet)](#8-stage-2--the-minecraft-ownership-gate-not-shipped-yet)
+8. [Stage 2 — the Minecraft ownership gate](#8-stage-2--the-minecraft-ownership-gate)
 
 ---
 
@@ -36,7 +43,7 @@ one Electron fuse byte and seven JavaScript flag bytes inside the embedded valid
 | sha256 pristine | `C1D3F36DBA310629AEDEC239B6C55A2F1CFE21E6930DFF2EE0440C169718628E` |
 | sha256 patched  | `CC94512FA4AC83D88A1EEA94A24D8D066D037F411B96CF7D23CB3ECA3A3C36D7` |
 | bytes written | **8**, across 3 logical sites |
-| companion | `integrity.dll` 13,840 B (Overwolf public-key carrier), `owutility.dll` 3,107,984 B (Overwolf Electron Utility 0.0.0.56), `resources\app.asar` 25,797,518 B — all untouched by this stage |
+| companion | `integrity.dll` 13,840 B (Overwolf public-key carrier), `owutility.dll` 3,107,984 B (Overwolf Electron Utility 0.0.0.56) — untouched; `resources\app.asar` 25,797,518 B is untouched by stage 1 and is the stage 2 target (sha256 pristine `40C41720…`, patched `4334600F…`) |
 
 A different Lunar build gets different offsets. The matcher fails hard instead of guessing:
 see [§5](#5-the-eight-bytes).
@@ -46,18 +53,25 @@ see [§5](#5-the-eight-bytes).
 ## 2. TL;DR — usage
 
 ```
-status.cmd     report pristine / patched / unknown + the 8 site states
-patch-now.cmd  back up the pristine exe, write the 8 bytes, verify by re-reading
-revert.cmd     restore the pristine exe from the backup (sha-checked before restore)
+status.cmd           report pristine / patched / unknown + the 8 exe site states
+patch-now.cmd        back up the pristine exe, write the 8 bytes, verify by re-reading
+revert.cmd           restore the pristine exe from the backup (sha-checked before restore)
+
+stage2-status.cmd    report the asar build, the 2 main.js spans and accounts.json
+patch-stage2.cmd     back up app.asar + accounts.json, write the 2 spans, verify by sha
+revert-stage2.cmd    restore the pristine app.asar + accounts.json from backup
 ```
 
 Close the launcher first — the script refuses to touch a running instance.
+
+Both stages are independent but stage 2 is useless without stage 1: with the fuse on,
+any edit to `app.asar` aborts startup before a single line of `main.js` runs.
 
 ---
 
 ## 3. What it does / what it does NOT do
 
-**Does:**
+**Stage 1 does:**
 
 * Blows Electron's `enableEmbeddedAsarIntegrityValidation` fuse **off**, so Electron stops
   re-hashing `app.asar` at load time.
@@ -66,15 +80,26 @@ Close the launcher first — the script refuses to touch a running instance.
   `invalid verification (browser: …)`.
 * Leaves a byte-identical pristine backup and restores it on `-Mode Revert`.
 
-**Does NOT:**
+**Stage 2 does:**
 
-* Does **not** touch `app.asar`, `main.js`, `integrity.dll`, `owutility.dll`, the Authenticode
-  signature, or any registry/file outside the exe and its backup.
-* Does **not** bypass the Minecraft account requirement — that check is server-side
-  (Mojang) and lives in `main.js`, and it needs stage 2
-  ([§8](#8-stage-2--the-minecraft-ownership-gate-not-shipped-yet)).
-* Does **not** grant multiplayer on online-mode servers, Lunar's own network features,
-  or anything else a real Microsoft/Mojang session provides.
+* Replaces `LR` — the entitlements check against `api.minecraftservices.com` — with a
+  constant `true`, which kills both `NO_OWNERSHIP` throws on the launcher's code paths.
+* Replaces the launch pipeline's `await zR(accessToken, remoteId)` — the profile +
+  privileges fetch from Mojang — with a literal object built out of `accounts.json`,
+  with `attributes: undefined` so the multiplayer and ban checks short-circuit.
+* Writes a schema-valid fake account into `accounts.json`, with a far-future token expiry
+  so the launcher never tries to refresh it.
+* Verifies the rebuilt asar by sha256 **before** writing, and restores both files from
+  backup on `-Mode Stage2Revert`.
+
+**Neither stage does:**
+
+* Does **not** grant multiplayer on online-mode servers — the server calls
+  `sessionserver.mojang.com` itself, and no local patch reaches it.
+* Does **not** unlock Lunar's own network (friends, cosmetics, cloud mods) — Lunar's
+  AssetServer rejects the fake session with `no-account`, every 30 s, harmlessly.
+* Does **not** touch the Authenticode signature, the registry, or anything outside the
+  exe, `app.asar`, `accounts.json` and the backup directory.
 
 ---
 
@@ -127,7 +152,9 @@ never compared inside `validateImpl()` — they are handed to `buildAppInfo()` a
 
 ---
 
-## 5. The eight bytes
+## 5. The patches
+
+### 5a. Stage 1 — the eight bytes
 
 | # | site | offset | from → to | effect |
 |---|---|---|---|---|
@@ -149,6 +176,41 @@ a bare `u=!0,p=` — the pristine binary already contains one unrelated `u=!1,p=
 `0x0B6D28AA`, which would make a naive pattern count ambiguous. Every site must resolve to
 exactly one candidate in either its original *or* patched form, and any unexpected byte
 value aborts the run with no write.
+
+### 5b. Stage 2 — the two spans in `main.js`
+
+`app.asar` is a 16-byte pickle header, a 347,756-byte JSON tree, then packed file data.
+`dist-electron/electron/main.js` sits at data offset `4939`, is 5,754,280 bytes long, and
+every other entry's offset is relative to the same base — so **a net-zero length edit inside
+`main.js` keeps the whole archive valid**. No rebuild, no header rewrite, no re-hash.
+
+| # | site | offset in `main.js` | span | effect |
+|---|---|---|---|---|
+| 1 | `auth.LR.ownership-check` | `0x21C38C` | 398 → 331 chars | `LR` (the `entitlements/license` GET) becomes `async e=>!0` |
+| 2 | `launch.profile-call` | `0x33FF32` | 34 → 101 chars | `await zR(r.accessToken,r.remoteId)` becomes an object literal from `accounts.json` |
+
+The 67 characters site 2 grows are eaten by the comment pad site 1 sheds, so
+`main.js` is still 5,754,280 bytes and the asar is still 25,797,518 bytes.
+
+```
+site 1 : LR=async e=>!0/*stage2: ownership gate disabled (LR)        */,
+site 2 : {username:r.minecraftProfile.name,uuid:r.minecraftProfile.id,nameChangeData:void 0,attributes:void 0}
+```
+
+Site 2 is deliberately **not** a patch of `zR`'s definition — `zR` is also called by
+`completeMcLogin`, the real Microsoft sign-in path, and rewriting its body would corrupt
+sign-in for a genuine account. Patching the single launch call site leaves that path intact.
+
+`attributes: undefined` is not laziness, it is the exact value Lunar itself produces when
+the privileges request fails (that call has a `.catch` that swallows). Both consumers are
+optional-chained — `a?.privileges.multiplayerServer === !1` and `a?.bannedScopes.some(…)`
+— so `undefined` walks straight past the `NO_MULTIPLAYER_ACCESS` and `BANNED` throws.
+
+**Matcher:** each span is located by its own unique anchor (`LR=async e=>{let t=IR();` and
+`await zR(r.accessToken,r.remoteId)`), then the full span is sliced and hashed against the
+recorded sha256 of the known build. A hit on the anchor with a different span hash aborts.
+The rebuilt asar's sha256 is compared against the recorded value **before** anything is
+written, so a wrong result is caught with the original file still intact.
 
 ---
 
@@ -173,62 +235,179 @@ Live boot of the **patched** launcher:
 * **0 hits** for `SECURITY` / `validation blocked` / `invalid verification` / `integrity`
   across every file in `%USERPROFILE%\.lunarclient\logs\launcher\*.log`
 
-That proves the seven JS byte-swaps still parse and the validator no longer blocks. What it
-does **not** yet prove is that a *modified* asar boots — that A/B test belongs to stage 2,
-because stage 1 ships without touching the asar at all.
+That proves the seven JS byte-swaps still parse and the validator no longer blocks.
+
+### The A/B test — is the gate load-bearing?
+
+Same machine, same day, only the two variables that matter:
+
+| | exe | asar | result |
+|---|---|---|---|
+| A (control) | pristine | pristine | 8 processes alive, 10 log files written, window up |
+| A (test) | pristine | **patched** | **exit code 1, 0 processes, 0 log files** — dies before the logger even initialises |
+| B | **patched** | **patched** | 7 processes alive, window `Home - Lunar Client` |
+
+A's two rows differ in one variable only, so the abort is the integrity gate doing exactly
+what §4 says it does: with the fuse on, a modified asar kills the app. Stage 1 is therefore
+load-bearing and not cosmetic.
+
+### Stage 2 round-trip
+
+```
+Stage2Status -> build PRISTINE, both spans original, accounts 0 entries
+Stage2Apply  -> asar sha 40c41720… -> 4334600f…, both spans patched, accounts 1 entry
+Stage2Status -> build PATCHED, 2/2 spans, accounts.json valid, expiry in the future
+Stage2Revert -> asar sha 40c41720…, accounts.json back to 0 entries
+Stage2Apply  -> asar sha 4334600f…   (byte-identical to the first apply — deterministic)
+```
+
+### Stage 2 live boot (test B)
+
+`%USERPROFILE%\.lunarclient\logs\launcher\auth.log`, untouched, in order:
+
+```
+[Auth] Account Ratman4080 is currently active
+[Auth] Validating account Ratman4080 owns Minecraft...
+[Auth] Account Ratman4080 successfully validated to own Minecraft, proceeding with profile retrieval...
+[Auth] Successfully retrieved Minecraft profile for account Ratman4080, checking multiplayer privileges...
+[Auth] Successfully validated account Ratman4080 owns Minecraft, checking banned status...
+[Auth] Account Ratman4080 has multiplayer access and is not banned, proceeding with login...
+```
+
+All six lines, in 11 ms, against `api.minecraftservices.com` — which was never contacted.
+No `Accounts file is invalid, creating new one...` (the `hEe`/`mEe` mask accepted the fake
+entry), no `[SECURITY]`, no `validation blocked`, no `NO_OWNERSHIP`.
+
+The renderer confirms it: title bar reads `Ratman4080`, the page greets
+`Welcome Back Astronaut, Ratman4080`, and the big green button reads
+**LAUNCH GAME — Lunar Client 26.3 with Fabric**. No sign-in wall, no "you must own
+Minecraft" dialog.
+
+What the launcher logs also show, and this is expected rather than a problem:
+
+```
+[AssetServer] No reconnect JWT available, going to Authenticator...
+[AssetServer] An unexpected error occurred while authenticating with Lunar Client:
+              No account found for getting Lunar Client Token (no-account)
+[AssetServer] Scheduling reconnect task...      (then every 30 s, forever, harmlessly)
+```
+
+That is Lunar's own network rejecting the fake session. It is caught, logged, and retried
+with backoff — it never touches the launch path.
+
+**Not yet run:** the game itself through Lunar (downloading the client and starting a
+`javaw` instance). The launcher gate is closed and proven; the game-side session is a
+separate question and one download away.
 
 ---
 
 ## 7. Limits
 
-* **The updater will undo it.** Lunar replaces `Lunar Client.exe` on any new release;
-  re-run `patch-now.cmd` after each update (the matcher will fail hard on an unknown build
-  rather than write at stale offsets).
+* **The updater will undo both stages.** Lunar replaces `Lunar Client.exe` and
+  `resources\app.asar` on any new release; re-run `patch-now.cmd` then `patch-stage2.cmd`
+  after each update. Both matchers fail hard on an unknown build rather than write at stale
+  offsets.
 * **Authenticode is left as-is.** The exe is still signed with Overwolf/Moonsworth's
   certificate over the *original* bytes, so the signature no longer matches the file on
   disk. Windows does not care for normal execution; SmartScreen may prompt on first run of
-  a freshly downloaded copy.
-* **Mojang still owns the account question.** Nothing in this patch makes an unowned
-  account work.
+  a freshly downloaded copy. `app.asar`'s embedded per-file SHA256 blocks in the asar header
+  are also now stale — that is exactly what the blown fuse stops Electron from checking.
+* **The fake account is not a Minecraft account.** It is a launcher-local record. Mojang has
+  never heard of `9f8e7d6c5b4a39281706f5e4d3c2b1a0` and nothing here changes that.
+* **Online-mode multiplayer stays closed.** The server, not the client, calls
+  `sessionserver.mojang.com`. Same for Realms, chat reporting, Mojang-side skins, and
+  anything on Lunar's own network.
 * No scheduled tasks, no watchers, no service, no registry writes — manual mode only.
 
 ---
 
-## 8. Stage 2 — the Minecraft ownership gate (not shipped yet)
+## 8. Stage 2 — the Minecraft ownership gate
 
-With the asar writable, the next gate is application-level, in
-`resources\app.asar\dist-electron\electron\main.js` (5,754,280 bytes), on the launch path:
+The launcher's launch pipeline, from `app.asar\dist-electron\electron\main.js`:
 
 ```js
-LR = async e => {
-  const r = await axios.get('https://api.minecraftservices.com/entitlements/license', {
-    headers: { Authorization: `Bearer ${e}` }
+LR = async e => {                                   // <- site 1, 398 chars
+  const t = axios.get('https://api.minecraftservices.com/entitlements/license', {
+    headers: { Authorization: `Bearer ${e}` },
+    params: { requestId: randomUUID() }
   });
-  return r.data.items.some(x => x.name === 'product_minecraft' || x.name === 'game_minecraft');
+  return (await t).data.items.some(x => x.name === 'product_minecraft' || x.name === 'game_minecraft');
 };
 // launch pipeline:
 if ([r, e] = await this.executeWithAccessToken(r, async e => LR(e.accessToken)), !e)
   throw new vR(SR.NO_OWNERSHIP, `This Microsoft account has not purchased Minecraft: Java Edition.`);
-const { username: t, uuid: n, nameChangeData: i, attributes: a } = await zR(r.accessToken, r.remoteId);
+const { username: t, uuid: n, nameChangeData: i, attributes: a } =
+  await zR(r.accessToken, r.remoteId);              // <- site 2, 34 chars
 if (a?.privileges.multiplayerServer === !1) throw new vR(SR.NO_MULTIPLAYER_ACCESS, ...);
-if (a?.bannedScopes.some(...))                    throw new vR(SR.BANNED, ...);
+if (a?.bannedScopes.some(...))                      throw new vR(SR.BANNED, ...);
 ```
 
-Four things are needed and none of them are shipped here: neuter `LR`, synthesise `zR`'s
-result instead of calling `api.minecraftservices.com`, keep the AssetServer client from
-killing the launch, and inject a schema-valid entry into
-`%USERPROFILE%\.lunarclient\settings\game\accounts.json` (currently `{"accounts": {}}`,
-masked against the `mEe` schema — an invalid shape is silently replaced with an empty one).
+Site 1 makes the entitlements check return `true` without leaving the process. Site 2 stops
+the profile/privileges fetch from reaching Mojang at all and hands the pipeline a literal
+built from `accounts.json`. The remaining failure mode is upstream of both:
+`executeWithAccessToken` refreshes the token when `dayjs(accessTokenExpiresAt).isBefore(now)`,
+and `refreshAccountInternal` throws `INVALID_SESSION` when the refresh token is fake — so the
+written account carries `2099-12-31T23:59:59.999Z` and a non-empty `refreshToken` (an empty
+one also makes the UI flag the account invalid, because `initAuthInternal` sets
+`invalid: !e.refreshToken`).
 
-**What stage 2 can and cannot buy, stated plainly:**
+### The fake account
+
+`%USERPROFILE%\.lunarclient\settings\game\accounts.json`, read by `AR()` and masked against
+`hEe` / `mEe` — a shape mismatch is silently replaced with `{"accounts": {}}`, which is why
+the schema is mirrored exactly, including the fields Lunar's own `_Ee` writes:
+
+```json
+{
+  "accounts": {
+    "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4": {
+      "accessToken": "stage2-offline-access-token",
+      "accessTokenExpiresAt": "2099-12-31T23:59:59.999Z",
+      "localId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
+      "refreshToken": "stage2-offline-refresh-token",
+      "minecraftProfile": { "id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0", "name": "Ratman4080" },
+      "remoteId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
+      "type": "Xbox",
+      "username": "Ratman4080",
+      "eligibleForMigration": false,
+      "hasMultipleProfiles": false,
+      "legacy": false,
+      "persistent": true,
+      "userProperties": []
+    }
+  },
+  "activeAccountLocalId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4"
+}
+```
+
+`minecraftProfile.id` must be 32 lowercase hex — `pN()` dashes it on the way out and `mN()`
+strips it on the way back, and both compare against that shape.
+
+### What stage 2 buys, stated plainly
 
 | | |
 |---|---|
-| launcher starts without Microsoft sign-in | achievable |
+| launcher starts and identifies as an account without Microsoft sign-in | **shipped, verified** |
+| `LAUNCH GAME` button present, auth pipeline completes | **shipped, verified** |
 | singleplayer, and `online-mode=false` servers | achievable — that is what any offline session gives you |
 | multiplayer on online-mode servers | **not achievable** — the server calls `sessionserver.mojang.com` itself |
-| Lunar AssetServer (friends, cosmetics, cloud mods) | **not achievable** — Lunar's own server rejects the session with `NO_OWNERSHIP` / `NO_MULTIPLAYER_ACCESS` |
+| Lunar AssetServer (friends, cosmetics, cloud mods) | **not achievable** — Lunar's own server rejects the session with `no-account` |
 | skin upload to Mojang | **not achievable** — needs a real access token |
 
 Nothing in stage 1 or 2 removes the requirement itself: that is Mojang's server-side
-entitlement check, and the launcher is only the messenger that reports it.
+entitlement check, and the launcher is only the messenger that reports it. What these two
+stages remove is the launcher's willingness to deliver that message.
+
+### Known behaviour change
+
+Site 1 is global: `LR` is also called by `completeMcLogin`, the genuine Microsoft sign-in
+path. With the patch in place a real account would skip the ownership check at sign-in too.
+That path is otherwise untouched — a real token still flows through `zR`, the privileges and
+ban checks, and the AssetServer handshake.
+
+### Revert
+
+`revert-stage2.cmd` restores `app.asar` from
+`%LOCALAPPDATA%\LunarPatch\backup\app.asar.pristine` (sha-checked first) and
+`accounts.json` from `accounts.json.pristine`. `revert.cmd` does the same for the exe. The
+two stages revert independently.

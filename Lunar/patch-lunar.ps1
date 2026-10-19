@@ -1,8 +1,12 @@
 param(
-    [ValidateSet('Status', 'Apply', 'Revert')]
+    [ValidateSet('Status', 'Apply', 'Revert', 'Stage2Status', 'Stage2Apply', 'Stage2Revert')]
     [string]$Mode = 'Status',
 
     [string]$ExePath = (Join-Path $env:LOCALAPPDATA 'Programs\Lunar Client\Lunar Client.exe'),
+
+    [string]$AsarPath = (Join-Path $env:LOCALAPPDATA 'Programs\Lunar Client\resources\app.asar'),
+
+    [string]$AccountsPath = (Join-Path $env:USERPROFILE '.lunarclient\settings\game\accounts.json'),
 
     [string]$BackupDir = (Join-Path $env:LOCALAPPDATA 'LunarPatch\backup')
 )
@@ -12,6 +16,75 @@ $ErrorActionPreference = 'Stop'
 $PristineSha = 'c1d3f36dba310629aedec239b6c55a2f1cfe21e6930dff2ee0440c169718628e'
 $PatchedSha = 'cc94512fa4ac83d88a1eea94a24d8d066d037f411b96cf7d23cb3eca3a3c36d7'
 $FuseMarker = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'
+
+# stage 2 - ownership gate. app.asar carries main.js at a fixed offset; both edits
+# are length-preserving, so the asar header never changes.
+$AsarPristineSha = '40c417203aabaf1fe01ac4c0482beada823c86f3762aaa72e122aa5c339c20ae'
+$AsarPatchedSha  = '4334600f59637c33c116bc6585bf3859534cc5d9acec901955a66c5d096e04ee'
+$AsarSize        = 25797518
+$HeaderLen       = 347756
+$MainOffset      = 4939
+$MainSize        = 5754280
+
+$S2LrText  = 'stage2: ownership gate disabled (LR)'
+$S2LrNew   = 'LR=async e=>!0/*' + $S2LrText + (' ' * (331 - 16 - $S2LrText.Length - 3)) + '*/,'
+$S2CallNew = '{username:r.minecraftProfile.name,uuid:r.minecraftProfile.id,nameChangeData:void 0,attributes:void 0}'
+
+$S2Sites = @(
+    [pscustomobject]@{
+        Name      = 'auth.LR.ownership-check'
+        OldAnchor = 'LR=async e=>{let t=IR();'
+        NewAnchor = 'LR=async e=>!0/*'
+        OldSpan   = 398
+        NewSpan   = 331
+        OldSha    = '4fa3e75ed8f87282f933fb05b92e31559877933260d290f4ef1d8cee8a90c3ea'
+        NewText   = $S2LrNew
+        Note      = 'entitlements check always true - both NO_OWNERSHIP throws die'
+    },
+    [pscustomobject]@{
+        Name      = 'launch.profile-call'
+        OldAnchor = 'await zR(r.accessToken,r.remoteId)'
+        NewAnchor = '{username:r.minecraftProfile.name,uuid:r.minecraftProfile.id'
+        OldSpan   = 34
+        NewSpan   = 101
+        OldSha    = '9f28452edf8466648d3d7697be31864c45b696b2b6a490b205f3ef4d78fba38b'
+        NewText   = $S2CallNew
+        Note      = 'profile from accounts.json - attributes void 0 short-circuits multiplayer/ban checks'
+    }
+)
+
+foreach ($s in $S2Sites) { if ($s.NewText.Length -ne $s.NewSpan) { throw ("internal: new span {0} is {1} chars, expected {2}" -f $s.Name, $s.NewText.Length, $s.NewSpan) } }
+$oldTotal = 0; $newTotal = 0
+foreach ($s in $S2Sites) { $oldTotal += $s.OldSpan; $newTotal += $s.NewSpan }
+if ($oldTotal -ne $newTotal) { throw 'internal: stage 2 spans are not net-zero' }
+
+$S2AccountId   = '9f8e7d6c5b4a39281706f5e4d3c2b1a0'
+$S2LocalId     = '7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4'
+$S2AccountsNew = @"
+{
+  "accounts": {
+    "$S2LocalId": {
+      "accessToken": "stage2-offline-access-token",
+      "accessTokenExpiresAt": "2099-12-31T23:59:59.999Z",
+      "localId": "$S2LocalId",
+      "refreshToken": "stage2-offline-refresh-token",
+      "minecraftProfile": {
+        "id": "$S2AccountId",
+        "name": "Ratman4080"
+      },
+      "remoteId": "$S2LocalId",
+      "type": "Xbox",
+      "username": "Ratman4080",
+      "eligibleForMigration": false,
+      "hasMultipleProfiles": false,
+      "legacy": false,
+      "persistent": true,
+      "userProperties": []
+    }
+  },
+  "activeAccountLocalId": "$S2LocalId"
+}
+"@
 
 Add-Type -TypeDefinition @'
 using System;
@@ -48,6 +121,17 @@ public static class LP
         using (System.IO.FileStream fs = System.IO.File.OpenRead(path))
         {
             byte[] d = h.ComputeHash(fs);
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(d.Length * 2);
+            for (int i = 0; i < d.Length; i++) sb.Append(d[i].ToString("x2"));
+            return sb.ToString();
+        }
+    }
+
+    public static string Sha256Bytes(byte[] data)
+    {
+        using (System.Security.Cryptography.SHA256 h = System.Security.Cryptography.SHA256.Create())
+        {
+            byte[] d = h.ComputeHash(data);
             System.Text.StringBuilder sb = new System.Text.StringBuilder(d.Length * 2);
             for (int i = 0; i < d.Length; i++) sb.Append(d[i].ToString("x2"));
             return sb.ToString();
@@ -137,6 +221,229 @@ function Write-Plan
             Note   = $_.Note
         }
     } | Format-Table -AutoSize | Out-String | Write-Output
+}
+
+function Get-MainSegment
+{
+    param([byte[]]$Asar)
+    if ($Asar.Length -ne $AsarSize) { throw ("asar is {0} bytes, expected {1} - not the known build" -f $Asar.Length, $AsarSize) }
+    if ([BitConverter]::ToUInt32($Asar, 0) -ne 4) { throw 'asar header magic mismatch' }
+    $hdrLen = [BitConverter]::ToUInt32($Asar, 12)
+    if ($hdrLen -ne $HeaderLen) { throw ("asar header is {0} bytes, expected {1}" -f $hdrLen, $HeaderLen) }
+    $base = 16 + [int]$hdrLen
+    if (-not ($Asar[$base] -eq 0x89 -and $Asar[$base + 1] -eq 0x50 -and $Asar[$base + 2] -eq 0x4E -and $Asar[$base + 3] -eq 0x47)) { throw 'asar data base not found - header layout changed' }
+    try
+    {
+        $json = [Text.Encoding]::UTF8.GetString($Asar, 16, [int]$hdrLen) | ConvertFrom-Json
+        $entry = $json.files.'dist-electron'.files.'electron'.files.'main.js'
+        if (-not $entry) { throw 'entry missing' }
+        if ([int64]$entry.size -ne $MainSize -or [string]$entry.offset -ne [string]$MainOffset) { throw 'entry offset/size mismatch' }
+    }
+    catch { Write-Warning ("asar header json cross-check skipped: {0}" -f $_.Exception.Message) }
+    $start = $base + $MainOffset
+    if (($start + $MainSize) -gt $Asar.Length) { throw 'main.js range falls outside the asar' }
+    $seg = New-Object byte[] $MainSize
+    [Array]::Copy($Asar, $start, $seg, 0, $MainSize)
+    return , $seg
+}
+
+function Get-SiteState
+{
+    param([byte[]]$Seg, [pscustomobject]$Site)
+    $state = 'none'
+    $offset = [long]-1
+    foreach ($pair in @(@($Site.OldAnchor, $Site.OldSpan, $Site.OldSha, 'original'), @($Site.NewAnchor, $Site.NewSpan, $null, 'patched')))
+    {
+        foreach ($hit in [LP]::FindAll($Seg, [LP]::Ascii($pair[0])))
+        {
+            if (($hit + [int]$pair[1]) -gt $Seg.Length) { continue }
+            $slice = New-Object byte[] ([int]$pair[1])
+            [Array]::Copy($Seg, $hit, $slice, 0, [int]$pair[1])
+            $actual = [LP]::Sha256Bytes($slice)
+            if ($pair[2]) { if ($actual -ne $pair[2]) { throw ("{0}: anchor matched but the surrounding span is unknown - build changed" -f $Site.Name) } }
+            elseif ($actual -ne [LP]::Sha256Bytes([LP]::Ascii($Site.NewText))) { throw ("{0}: patched anchor matched but the span is not ours" -f $Site.Name) }
+            if ($state -ne 'none') { throw ("{0}: {1} candidate spans resolved, expected 1" -f $Site.Name, 2) }
+            $state = [string]$pair[3]
+            $offset = [long]$hit
+        }
+    }
+    if ($state -eq 'none') { throw ("{0}: neither the original nor the patched span is present" -f $Site.Name) }
+    return [pscustomobject]@{ Site = $Site; State = $state; Offset = $offset }
+}
+
+function New-PatchedSegment
+{
+    param([byte[]]$Seg, [object[]]$Found)
+    $sorted = @($Found | Sort-Object Offset)
+    $pieces = New-Object System.Collections.Generic.List[byte[]]
+    $pos = 0
+    $total = 0
+    foreach ($f in $sorted)
+    {
+        if ($f.Offset -lt $pos) { throw 'internal: stage 2 spans overlap' }
+        $curSpan = if ($f.State -eq 'original') { $f.Site.OldSpan } else { $f.Site.NewSpan }
+        $headLen = [int]$f.Offset - $pos
+        if ($headLen -gt 0)
+        {
+            $head = New-Object byte[] $headLen
+            [Array]::Copy($Seg, $pos, $head, 0, $headLen)
+            $pieces.Add($head)
+            $total += $headLen
+        }
+        if ($f.State -eq 'original')
+        {
+            $repl = [LP]::Ascii($f.Site.NewText)
+            $pieces.Add($repl)
+            $total += $repl.Length
+        }
+        $pos = [int]$f.Offset + $curSpan
+    }
+    $tailLen = $Seg.Length - $pos
+    if ($tailLen -lt 0) { throw 'internal: stage 2 spans run past the end of the segment' }
+    if ($tailLen -gt 0)
+    {
+        $tail = New-Object byte[] $tailLen
+        [Array]::Copy($Seg, $pos, $tail, 0, $tailLen)
+        $pieces.Add($tail)
+        $total += $tailLen
+    }
+    if ($total -ne $Seg.Length) { throw ("net-zero violated: rebuilt main.js is {0} bytes, expected {1}" -f $total, $Seg.Length) }
+    $out = New-Object byte[] $total
+    $o = 0
+    foreach ($p in $pieces) { [Array]::Copy($p, 0, $out, $o, $p.Length); $o += $p.Length }
+    return , $out
+}
+
+function Show-AccountsStatus
+{
+    if (-not (Test-Path $AccountsPath)) { Write-Output 'accounts : missing'; return }
+    try { $j = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($AccountsPath)) | ConvertFrom-Json }
+    catch { Write-Output ("accounts : INVALID json - {0}" -f $_.Exception.Message); return }
+    $props = @($j.accounts.PSObject.Properties)
+    Write-Output ("accounts : {0} entry/entries, active = {1}" -f $props.Count, $j.activeAccountLocalId)
+    $now = (Get-Date).ToUniversalTime()
+    foreach ($p in $props)
+    {
+        $a = $p.Value
+        $future = $false
+        try { $future = ([datetime]$a.accessTokenExpiresAt).ToUniversalTime() -gt $now } catch { }
+        Write-Output ("  {0,-12} type={1,-6} exp={2} future={3} refresh={4} uuid={5}" -f $a.username, $a.type, $a.accessTokenExpiresAt, $future, [bool]$a.refreshToken, $a.minecraftProfile.id)
+        if (-not $future) { Write-Warning 'accessTokenExpiresAt is not in the future - the launcher will try to refresh the fake token and fail' }
+        if (-not $a.refreshToken) { Write-Warning 'refreshToken is empty - the UI flags this account as invalid' }
+        if ($p.Name -ne $j.activeAccountLocalId) { Write-Warning ("account key {0} is not activeAccountLocalId" -f $p.Name) }
+    }
+}
+
+function Write-Accounts
+{
+    if (Test-Path $AccountsPath)
+    {
+        $backup = Join-Path $BackupDir 'accounts.json.pristine'
+        if (-not (Test-Path $backup)) { Copy-Item $AccountsPath $backup -Force; Write-Output ("backup   : {0}" -f $backup) }
+    }
+    $dir = Split-Path -Parent $AccountsPath
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [IO.File]::WriteAllText($AccountsPath, $S2AccountsNew)
+    Write-Output ("accounts : {0}" -f $AccountsPath)
+}
+
+function Invoke-Stage2
+{
+    param([string]$Requested)
+
+    if (-not (Test-Path $AsarPath)) { throw ("target not found: {0}" -f $AsarPath) }
+    if ($Requested -ne 'Stage2Status' -and (Get-Process -Name 'Lunar Client' -ErrorAction SilentlyContinue)) { throw 'Lunar Client is running - close it first' }
+
+    $bytes = [IO.File]::ReadAllBytes($AsarPath)
+    $sha = [LP]::Sha256Bytes($bytes)
+    $build = if ($sha -eq $AsarPristineSha) { 'PRISTINE' } elseif ($sha -eq $AsarPatchedSha) { 'PATCHED' } else { 'UNKNOWN' }
+
+    if ($Requested -eq 'Stage2Status')
+    {
+        Write-Output ("asar     : {0}" -f $AsarPath)
+        Write-Output ("sha256   : {0}" -f $sha)
+        Write-Output ("size     : {0} bytes" -f $bytes.Length)
+        Write-Output ("build    : {0}" -f $build)
+        Write-Output ""
+        if ($build -eq 'UNKNOWN')
+        {
+            Write-Output 'main.js  : not inspected - the asar is not a known build'
+        }
+        else
+        {
+            $seg = Get-MainSegment -Asar $bytes
+            $rows = @()
+            foreach ($site in $S2Sites) { $rows += Get-SiteState -Seg $seg -Site $site }
+            $rows | ForEach-Object {
+                [pscustomobject]@{
+                    Site   = $_.Site.Name
+                    Offset = ('main.js+0x{0:x}' -f $_.Offset)
+                    State  = $_.State
+                    Note   = $_.Site.Note
+                }
+            } | Format-Table -AutoSize | Out-String | Write-Output
+            $patchedCount = @($rows | Where-Object { $_.State -eq 'patched' }).Count
+            $word = if ($patchedCount -eq $S2Sites.Length) { 'PATCHED' } elseif ($patchedCount -eq 0) { 'ORIGINAL' } else { 'PARTIAL' }
+            Write-Output ("state    : {0} ({1}/{2})" -f $word, $patchedCount, $S2Sites.Length)
+        }
+        Write-Output ""
+        Show-AccountsStatus
+        return
+    }
+
+    if ($build -eq 'UNKNOWN') { throw 'asar is not the known 3.7.25-ow build - refusing to touch it' }
+
+    if ($Requested -eq 'Stage2Revert')
+    {
+        $backup = Join-Path $BackupDir 'app.asar.pristine'
+        if (-not (Test-Path $backup)) { throw ("no asar backup at {0} - reinstall Lunar Client to get a clean app.asar" -f $backup) }
+        if ([LP]::Sha256($backup) -ne $AsarPristineSha) { throw 'asar backup integrity check failed - refusing to restore' }
+        Copy-Item $backup $AsarPath -Force
+        Write-Output ("asar     : restored from backup")
+        Write-Output ("sha256   : {0}" -f [LP]::Sha256($AsarPath))
+        $acctBackup = Join-Path $BackupDir 'accounts.json.pristine'
+        if (Test-Path $acctBackup) { Copy-Item $acctBackup $AccountsPath -Force; Write-Output ("accounts : restored from backup") }
+        else { Write-Warning 'no accounts.json backup - the written file is left in place' }
+        return
+    }
+
+    $seg = Get-MainSegment -Asar $bytes
+    $found = @()
+    foreach ($site in $S2Sites) { $found += Get-SiteState -Seg $seg -Site $site }
+    $newSeg = New-PatchedSegment -Seg $seg -Found $found
+
+    $newAsar = New-Object byte[] $bytes.Length
+    [Array]::Copy($bytes, 0, $newAsar, 0, $bytes.Length)
+    [Array]::Copy($newSeg, 0, $newAsar, (16 + $HeaderLen + $MainOffset), $MainSize)
+    $newSha = [LP]::Sha256Bytes($newAsar)
+    if ($newSha -ne $AsarPatchedSha) { throw ("rebuilt asar sha {0} does not match the expected {1} - aborting before any write" -f $newSha, $AsarPatchedSha) }
+
+    if (-not (Test-Path $BackupDir)) { New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null }
+    if ($build -eq 'PRISTINE')
+    {
+        $backup = Join-Path $BackupDir 'app.asar.pristine'
+        Copy-Item $AsarPath $backup -Force
+        Write-Output ("backup   : {0}" -f $backup)
+    }
+    $temp = "$AsarPath.lunarnew"
+    [IO.File]::WriteAllBytes($temp, $newAsar)
+    Move-Item $temp $AsarPath -Force
+
+    $check = [LP]::Sha256($AsarPath)
+    if ($check -ne $AsarPatchedSha) { throw 'post-write asar verification failed' }
+    Write-Output ("asar     : {0}" -f $AsarPath)
+    Write-Output ("sha256   : {0}" -f $check)
+    Write-Output ("state    : PATCHED ({0}/{1} spans, header untouched, {2} bytes)" -f $S2Sites.Length, $S2Sites.Length, $AsarSize)
+    Write-Output ""
+    Write-Accounts
+    Write-Output ""
+    Show-AccountsStatus
+}
+
+if ($Mode -like 'Stage2*')
+{
+    Invoke-Stage2 -Requested $Mode
+    return
 }
 
 if (-not (Test-Path $ExePath)) { throw ("target not found: {0}" -f $ExePath) }
