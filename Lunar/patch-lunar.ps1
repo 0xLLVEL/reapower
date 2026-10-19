@@ -58,7 +58,10 @@ $oldTotal = 0; $newTotal = 0
 foreach ($s in $S2Sites) { $oldTotal += $s.OldSpan; $newTotal += $s.NewSpan }
 if ($oldTotal -ne $newTotal) { throw 'internal: stage 2 spans are not net-zero' }
 
-$S2AccountId   = '9f8e7d6c5b4a39281706f5e4d3c2b1a0'
+# minecraftProfile.id MUST look like a random v4 UUID: mN() only strips dashes when
+# fN=/^(...4...|[89ab]...)$/ matches, so a non-v4 id breaks getAccount(dashedId) and the
+# AssetServer client dies with SR.NO_ACCOUNT before it ever opens a socket.
+$S2AccountId   = '9f8e7d6c5b4a49289706f5e4d3c2b1a0'
 $S2LocalId     = '7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4'
 $S2AccountsNew = @"
 {
@@ -295,6 +298,13 @@ function New-PatchedSegment
             $repl = [LP]::Ascii($f.Site.NewText)
             $pieces.Add($repl)
             $total += $repl.Length
+        }
+        else
+        {
+            $keep = New-Object byte[] $curSpan
+            [Array]::Copy($Seg, [int]$f.Offset, $keep, 0, $curSpan)
+            $pieces.Add($keep)
+            $total += $curSpan
         }
         $pos = [int]$f.Offset + $curSpan
     }

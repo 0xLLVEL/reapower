@@ -317,6 +317,18 @@ separate question and one download away.
 * **Online-mode multiplayer stays closed.** The server, not the client, calls
   `sessionserver.mojang.com`. Same for Realms, chat reporting, Mojang-side skins, and
   anything on Lunar's own network.
+* **Re-applying over an already-patched asar is a different code path** than applying over a
+  pristine one: the rebuilt segment has to pass the two existing spans *through* instead of
+  replacing them. An earlier version of the script dropped them and the net-zero assertion
+  caught it before any write (`net-zero violated: rebuilt main.js is 5753848 bytes`). Fixed;
+  `-Mode Stage2Apply` is now idempotent and re-verifies to the same `4334600f…` sha.
+* **One observed `accounts.json` wipe.** In a single boot — the one immediately after force-
+  killing seven launcher processes — the launcher came up with `No accounts found, setting to
+  guest mode...` and left `{"accounts": {}}` behind, and quit itself 29 s later. It did not
+  reproduce: a clean re-run polled the file every 3 s for 43 s across a full boot and it
+  never moved off 739 bytes. Treat it as a hazard of killing a live instance rather than a
+  steady state, and check `-Mode Stage2Status` after any unclean shutdown — it reports the
+  entry count, and `0 entry/entries` while the asar reads `PATCHED` means re-run Apply.
 * No scheduled tasks, no watchers, no service, no registry writes — manual mode only.
 
 ---
@@ -382,6 +394,39 @@ the schema is mirrored exactly, including the fields Lunar's own `_Ee` writes:
 
 `minecraftProfile.id` must be 32 lowercase hex — `pN()` dashes it on the way out and `mN()`
 strips it on the way back, and both compare against that shape.
+
+It must **also look like a random v4 UUID**, which is a nastier trap than it sounds:
+
+```js
+fN = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|...)$/i
+mN = e => fN.test(e) ? e.replace(/-/g, ``) : e
+```
+
+`mN()` only strips the dashes `pN()` added **if the dashed form passes a strict v4 check** —
+version nibble `4`, variant nibble `[89ab]`. `getAccount(dashedId)` compares the result
+against the *undashed* `minecraftProfile.id`, so a non-v4 id makes the lookup miss and the
+AssetServer client aborts with `SR.NO_ACCOUNT` before it ever opens a socket:
+
+```
+[AssetServer] An unexpected error occurred while authenticating with Lunar Client:
+              No account found for getting Lunar Client Token (no-account)
+```
+
+An id like `9f8e7d6c5b4a3928…` has version nibble `3` and variant nibble `1` — it fails `fN`.
+`9f8e7d6c5b4a4928…` passes. With the v4-shaped id the launcher gets all the way to Lunar's
+real authenticator:
+
+```
+[Auth] [Authenticator] Connection opened for Ratman4080 (…)
+[Auth] [Authenticator] Creating Minecraft session for Ratman4080 (…)
+[Auth] [Authenticator] Failed to create Minecraft session: Failed to create Minecraft session (mc-create-session)
+[Auth] [Authenticator] Connection disconnected … Code: 1000 - Reason: Failed encryption (…)
+```
+
+That is the last wall on this path: `mc-create-session` is the launcher proxying
+`login_with_xbox` + session join to Mojang with a token that does not exist. Everything
+before it — local account, entitlements gate, profile gate, WebSocket handshake to
+`wss://authenticator.lunarclientprod.com/launcher-v3` — now succeeds.
 
 ### What stage 2 buys, stated plainly
 
