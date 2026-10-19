@@ -14,6 +14,30 @@
     .\idm_keygen.ps1 -Count 1                            one serial
     .\idm_keygen.ps1 -Validate XXXXX-XXXXX-XXXXX-XXXXX   audit a serial
     .\idm_keygen.ps1 -SelfTest                           reference vectors + round-trips
+    .\idm_keygen.ps1 -Status                             show the verdict state IDM will read
+    .\idm_keygen.ps1 -Purge                              drop the sticky cached verdicts
+
+  Two-stage verdict (both stages live in IDMan.exe 6.43.15.2):
+
+    Stage 1 - the registration dialog's OnOk, RVA 0x122910.  Pure arithmetic:
+    length 23, dashes at 5/11/17, each five-character block decoded against a
+    36-glyph alphabet (built in place by OnOk at RVA 0x122954) in base 0x25,
+    and each block must be a NONZERO MULTIPLE of 43, 23, 17 and 53 (RVA
+    0x122E24).  This stage decides the serial.  A serial this tool generates
+    passes it.
+
+    Stage 2 - the startup verifier, RVA 0x11ffc0.  Runs right after OnOk and
+    again on later launches.  It reads IDM's own bookkeeping - the values
+    nExpDt (expiry) and nLst (last check) plus a cached answer record written
+    as checkRes1_<serial-prefix> / checkRes2_<serial-prefix> under
+    SOFTWARE\Internet Download Manager - and maps that record to one of the
+    statuses 2/3/4/7/10/11/12 (RVA 0x120EAD).  Status 4 continues; status 3
+    raises the counterfeit/blocked message and exits.  No cached record means
+    the comparison chain falls through to status 4, which is accepted.
+
+    -Purge deletes every checkRes* value it can reach, so stage 2 has no
+    stale verdict to replay.  It never touches the serial, MData, nExpDt or
+    nLst - only the cached answers.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Generate')]
 param(
@@ -23,6 +47,12 @@ param(
     [Parameter(ParameterSetName = 'Generate')]
     [ValidateRange(1, 200)]
     [int]$Count = 5,
+
+    [Parameter(ParameterSetName = 'Purge')]
+    [switch]$Purge,
+
+    [Parameter(ParameterSetName = 'Status')]
+    [switch]$Status,
 
     [Parameter(ParameterSetName = 'SelfTest')]
     [switch]$SelfTest
@@ -187,12 +217,154 @@ function Invoke-SelfTest {
     if ($failed -gt 0) { exit 1 }
 }
 
+function Get-IdmRegistryRoots {
+    @(
+        [pscustomobject]@{ Label = 'HKLM SOFTWARE\Internet Download Manager';             Path = 'HKLM:\SOFTWARE\Internet Download Manager' },
+        [pscustomobject]@{ Label = 'HKLM SOFTWARE\WOW6432Node\Internet Download Manager'; Path = 'HKLM:\SOFTWARE\WOW6432Node\Internet Download Manager' },
+        [pscustomobject]@{ Label = 'HKCU SOFTWARE\Internet Download Manager';             Path = 'HKCU:\SOFTWARE\Internet Download Manager' },
+        [pscustomobject]@{ Label = 'HKCU SOFTWARE\WOW6432Node\Internet Download Manager'; Path = 'HKCU:\SOFTWARE\WOW6432Node\Internet Download Manager' }
+    )
+}
+
+function Format-IdmValue {
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return '<absent>' }
+    if ($Value -is [byte[]]) {
+        $hex = ($Value | ForEach-Object { $_.ToString('X2') }) -join ''
+        if ($hex.Length -gt 96) { return ($hex.Substring(0, 96) + '...') }
+        return $hex
+    }
+    $text = [string]$Value
+    if ($text.Length -gt 96) { return ($text.Substring(0, 96) + '...') }
+    return $text
+}
+
+function Invoke-IdmPurge {
+    $roots    = Get-IdmRegistryRoots
+    $removed  = 0
+    $skipped  = 0
+
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root.Path)) {
+            Write-Output ('  absent   {0}' -f $root.Label)
+            continue
+        }
+        try {
+            $item  = Get-Item -LiteralPath $root.Path
+            $names = @($item.GetValueNames() | Where-Object { $_ -like 'checkRes*' })
+        }
+        catch {
+            $skipped++
+            Write-Output ('  denied   {0}  {1}' -f $root.Label, $_.Exception.Message)
+            continue
+        }
+        if ($names.Count -eq 0) {
+            Write-Output ('  clean    {0}' -f $root.Label)
+            continue
+        }
+        foreach ($name in $names) {
+            try {
+                Remove-ItemProperty -LiteralPath $root.Path -Name $name
+                $removed++
+                Write-Output ('  removed  {0}\{1} = {2}' -f $root.Label, $name,
+                    (Format-IdmValue -Value $item.GetValue($name)))
+            }
+            catch {
+                $skipped++
+                Write-Output ('  denied   {0}\{1}  {2}' -f $root.Label, $name, $_.Exception.Message)
+            }
+        }
+    }
+
+    Write-Output ('purge      {0} cached verdict(s) removed, {1} denied' -f $removed, $skipped)
+    if ($removed -eq 0) {
+        Write-Output 'purge      nothing to drop - stage 2 had no stored verdict to replay'
+    }
+    if ($skipped -gt 0) {
+        Write-Output 'purge      re-run from an elevated prompt to reach the HKLM values'
+    }
+}
+
+function Show-IdmState {
+    $candidates = @()
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} 'Internet Download Manager\IDMan.exe')
+    }
+    $candidates += (Join-Path $env:ProgramFiles 'Internet Download Manager\IDMan.exe')
+    $exe = @($candidates | Where-Object { Test-Path -LiteralPath $_ }) | Select-Object -First 1
+    if (-not $exe) { $exe = $candidates[0] }
+
+    Write-Output '--- binary ---'
+    if (Test-Path -LiteralPath $exe) {
+        $info = Get-Item -LiteralPath $exe
+        Write-Output ('  path     {0}' -f $exe)
+        Write-Output ('  bytes    {0}' -f $info.Length)
+        Write-Output ('  sha256   {0}' -f (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash)
+    }
+    else {
+        Write-Output ('  missing  {0}' -f $exe)
+    }
+
+    Write-Output '--- stage 2 inputs ---'
+    foreach ($root in Get-IdmRegistryRoots) {
+        if (-not (Test-Path -LiteralPath $root.Path)) {
+            Write-Output ('  absent   {0}' -f $root.Label)
+            continue
+        }
+        try { $item = Get-Item -LiteralPath $root.Path }
+        catch {
+            Write-Output ('  denied   {0}  {1}' -f $root.Label, $_.Exception.Message)
+            continue
+        }
+        $names = @($item.GetValueNames() | Sort-Object)
+        Write-Output ('  root     {0}  ({1} value(s))' -f $root.Label, $names.Count)
+        foreach ($name in $names) {
+            Write-Output ('           {0,-16} {1}' -f $name, (Format-IdmValue -Value $item.GetValue($name)))
+        }
+    }
+
+    Write-Output '--- per-user ---'
+    $userPath = 'HKCU:\Software\DownloadManager'
+    if (Test-Path -LiteralPath $userPath) {
+        $item = Get-Item -LiteralPath $userPath
+        foreach ($name in @($item.GetValueNames() | Sort-Object)) {
+            if ($name -notlike '*vers*' -and $name -notlike '*erial*' -and $name -notlike '*nfo*') { continue }
+            Write-Output ('           {0,-16} {1}' -f $name, (Format-IdmValue -Value $item.GetValue($name)))
+        }
+    }
+    else {
+        Write-Output '           HKCU\Software\DownloadManager absent'
+    }
+
+    Write-Output '--- verdict ---'
+    $stored = 0
+    foreach ($root in Get-IdmRegistryRoots) {
+        if (-not (Test-Path -LiteralPath $root.Path)) { continue }
+        try { $stored += @((Get-Item -LiteralPath $root.Path).GetValueNames() | Where-Object { $_ -like 'checkRes*' }).Count }
+        catch { }
+    }
+    if ($stored -gt 0) {
+        Write-Output ('  {0} cached verdict(s) present - stage 2 will replay them' -f $stored)
+        Write-Output '  run  .\idm_keygen.ps1 -Purge  to drop them'
+    }
+    else {
+        Write-Output '  no cached verdict - stage 2 falls through to status 4 (continue)'
+    }
+}
+
 switch ($PSCmdlet.ParameterSetName) {
     'Validate' {
         Show-IdmSerial -Result (Test-IdmSerial -Text $Validate)
     }
     'SelfTest' {
         Invoke-SelfTest
+    }
+    'Purge' {
+        Invoke-IdmPurge
+    }
+    'Status' {
+        Show-IdmState
     }
     default {
         for ($i = 0; $i -lt $Count; $i++) {

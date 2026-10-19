@@ -737,6 +737,46 @@ the dialog; the format-check function `0x121E10` has two callers (`0x122560`, `0
 neither on the startup path. That is also what makes §10's claim precise: the validator
 code sits intact in the file and is unreachable from startup.
 
+### Stage 2 — the startup verifier, RVA `0x11ffc0`
+
+Passing the dialog is not the whole verdict. Right after `OnOk` returns, `0x121820` →
+`0x121050` → `0x11ffc0` runs a second, separate decision, and it runs again on later
+launches. What it reads is **IDM's own bookkeeping, not the serial's arithmetic**:
+
+* the seven-character prefix `serial[0..4] + serial[6..7]` (the field at `obj+0x43E`,
+  index 5 skipped because it is the dash), formatted through the XOR-0x2B mask at
+  `0x1200B0` into `checkRes%ld_%s` — the registry value names `checkRes1_<prefix>` and
+  `checkRes2_<prefix>`;
+* `nExpDt` (expiry) and `nLst` (last check), written at `0x120C67` and deleted at
+  `0x120BC1`/`0x120C14`/`0x120D36`;
+* an answer record built with `'%s %s %ld:'`, `type` and `answer` (`0x6C366C`–`0x6C3680`).
+
+That record is then matched, not computed. The tail at `0x120EAD` is an `strcmp` chain
+over the buffer at `[esp+0x42e8]` — first against the serial itself (`0x120B4A`,
+`lea ecx,[ebx+0x43E]`), then against twelve message globals, each match assigning a status:
+
+| matched | status |
+|---|---|
+| `[0x78a714]` | 2 |
+| `[0x78a71c]` | 7 |
+| `[0x78a734]` | 10 |
+| `[0x78a738]` | 11 |
+| `[0x78a73c]` | 12 |
+| `[0x78a718]` equal | **3** |
+| nothing matched (the default) | **4** |
+
+Status is returned to `0x2B40`, which does `0x4B7B0(r, 0, arg3)` and then branches on it:
+`r == 4` continues, anything else ends the dialog and calls `ExitProcess(0)`. Inside
+`0x4B7B0`, case 4 lands on `0x4B9A2`, which only shows a box when its third argument is
+`6` *and* `0x77BD24` is still zero — otherwise it falls straight into the epilogue at
+`0x4B9CA` and shows nothing. **No stored record means no match, so the chain falls through
+to status 4, which is accepted.**
+
+That is what `-Purge` exists for: a `checkRes*` value left behind by an earlier attempt is
+the one thing stage 2 will replay, and it is keyed only by the serial prefix, so it can
+keep rejecting after the serial underneath it has changed. `-Purge` deletes `checkRes*`
+only — never `MData`, `nExpDt`, `nLst`, or the serial.
+
 ### `tools\idm_keygen.ps1`
 
 Zero-dependency PowerShell, like everything else here.
@@ -746,6 +786,8 @@ Zero-dependency PowerShell, like everything else here.
 .\tools\idm_keygen.ps1 -Count 1                     # one serial
 .\tools\idm_keygen.ps1 -Validate XXXXX-XXXXX-XXXXX-XXXXX   # audit any serial
 .\tools\idm_keygen.ps1 -SelfTest                    # reference vectors + 500 round-trips
+.\tools\idm_keygen.ps1 -Status                      # the binary hash + every stage-2 input
+.\tools\idm_keygen.ps1 -Purge                       # drop the cached checkRes verdicts
 ```
 
 Generation draws five glyphs per block, keeps only values satisfying that block's modulus,
@@ -775,6 +817,26 @@ case/whitespace tolerance — plus 500 generated round-trips, and reports `selft
 passed`. The same vectors and 60 freshly generated serials were then checked against a
 second implementation written independently from the same disassembly: two
 implementations, one set of bytes, zero disagreements.
+
+**Machine state, read with `-Status`.** Not a dialog run — a registry and hash read, on the
+box the patch ships to:
+
+```
+IDMan.exe  sha256 3406A8105779F5BFAE41A05A2349306FBBCE2D8546CF3DC83F63AA9256B4CABD   (site 5 applied)
+HKCU\Software\DownloadManager  Serial  CCA2O-LW5WY-DWAMV-I8XNK   idmvers  v6.43b15 Full
+SOFTWARE\Internet Download Manager (all four roots)   no checkRes / nExpDt / nLst / MData
+```
+
+That serial passes the reversed gate block for block:
+
+```
+CCA2O -> 15406728 %43 == 0     LW5WY -> 49687153 %23 == 0
+DWAMV -> 44026124 %17 == 0     I8XNK -> 40943189 %53 == 0
+```
+
+and with no `checkRes*` present anywhere, stage 2 has no record to replay and lands on
+status 4. `-Purge` reports `0 cached verdict(s) removed` on this box, which is the state
+you want before a registration attempt.
 
 What has **not** been done is typing a generated serial into a live IDM dialog — that step
 is yours. Hand-built check vector if you want to verify the reasoning rather than the tool:
