@@ -12,12 +12,18 @@ Electron **42.7.1**), plus one Fabric mod. Three stages, all shipped:
   `LAUNCH GAME`, and reaches the end of its auth pipeline.
 * **Stage 3** is a Fabric mod that injects `PlayerCosmeticsPushV2` locally, so cosmetics
   render without Lunar's AssetServer ever issuing a JWT.
+* **Stage 4** rebrands the launcher and closes its ad slot: four length-preserving edits
+  across `app.asar\dist\assets\use-show-ad.js` and `app.asar\dist\html\main.html`. The
+  window title and the boot splash become yours, and the `<Ad>` component — which renders
+  both the `owadview` element and the "Lunar Plus" upsell button from a single return —
+  now returns `null` unconditionally.
 
-Stages 1 and 2 operate on your own installation, on disk, with no network calls: an analysis
-of a shipped native/JS binary and a byte-level patch of it — **8 bytes of the
-235,252,216-byte exe differ**, and **432 bytes inside the 5,754,280-byte `main.js` differ
-while its total length stays exactly the same** — which is why the asar header never has to
-be rebuilt. Stage 3 touches nothing on disk outside the `mods` folder.
+Stages 1, 2 and 4 operate on your own installation, on disk, with no network calls: an
+analysis of a shipped native/JS binary and a byte-level patch of it — **8 bytes of the
+235,252,216-byte exe differ**, and **432 bytes inside the 5,754,280-byte `main.js` differ,
+plus 4 sites in the renderer**, in every case while the total length stays exactly the
+same — which is why the asar header never has to be rebuilt. Stage 3 touches nothing on
+disk outside the `mods` folder.
 
 ---
 
@@ -32,6 +38,7 @@ be rebuilt. Stage 3 touches nothing on disk outside the `mods` folder.
 7. [Limits](#7-limits)
 8. [Stage 2 — the Minecraft ownership gate](#8-stage-2--the-minecraft-ownership-gate)
 9. [Stage 3 — cosmetics without the AssetServer](#9-stage-3--cosmetics-without-the-assetserver)
+10. [Stage 4 — branding, and the ad slot](#10-stage-4--branding-and-the-ad-slot)
 
 ---
 
@@ -842,3 +849,152 @@ Log: `%USERPROFILE%\.lunarclient\settings\game\rat-cosmetics.log`.
   finds them in seconds.
 * Compiles against **JDK 25** (`javac 25.0.4.1`), class file version 69, which the bundled
   Zulu JRE 25 reads natively.
+
+---
+
+## 10. Stage 4 — branding, and the ad slot
+
+### Where the launcher's UI actually lives
+
+The asar header, read from the bytes rather than assumed (first 16:
+`04 00 00 00 74 4e 05 00 70 4e 05 00 6c 4e 05 00`):
+
+| field | byte | value |
+|---|---|---|
+| `[0:4]` | 0 | `4` — size of the following pickle |
+| `[4:8]` | 4 | `347764` — size of the header block from byte 8 |
+| `[8:12]` | 8 | `347760` — json length + 4 |
+| `[12:16]` | 12 | `347756` — json string length |
+| `[16:]` | 16 | the JSON tree, then padding to 4-byte alignment |
+
+Data therefore starts at byte **347772**. The tree holds **1326 entries**, of which **40 are
+unpacked** — native binaries (`7za`, `bsdiff.node`, `better_sqlite3.node`) that live in
+`app.asar.unpacked\` and are never inside the asar, so this stage does not touch them.
+
+The UI splits across two bundles:
+
+| path | size | role |
+|---|---|---|
+| `/dist-electron/electron/main.js` | 5,754,280 | main process; carries the i18n strings |
+| `/dist-electron/preload/launcher/index.js` | 36,675 | renderer↔main bridge |
+| `/dist/html/main.html` | 6,560 | document, `<title>`, boot splash |
+| `/dist/assets/main.js` | 2,154,897 | application bundle |
+| `/dist/assets/topbar.js` | 1,433,377 | top bar, account chip |
+| `/dist/assets/theme-wrapper.css` | 263,058 | styling |
+| `/dist/assets/use-show-ad.js` | 40,420 | the ad system |
+
+### Why every edit here is length-preserving
+
+An asar records a **per-file size and an absolute offset** in its header. A file that
+changes length shifts every file packed after it, which forces the whole 347,756-byte
+header to be rebuilt and all 1286 embedded offsets recomputed. Net-zero edits leave the
+header byte-identical and the data section exactly where it was, so stage 4 only ever
+rewrites bytes *inside* a file it located through the real header. That is the same reason
+stage 2 works, and it is not a coincidence — it is the only cheap way to edit an asar.
+
+### The ad gate
+
+`use-show-ad.js` exports `vn`, the `<Ad>` component:
+
+```js
+vn=e=>{let t=Jt(),n=f(e=>e.metadata.ads),[r,i]=(0,F.useState)(!1),
+      a=n?.find(t=>t.placement===e.placement);
+      if(!(a&&e.willShowAd))return null;
+```
+
+Both things it goes on to render — the `owadview` element and, unless `hidePlusCta` is set,
+the "Lunar Plus" upsell button (`alt:"Lunar Plus"`, `cta_text`) — sit inside that one
+`return`. So closing the gate at the top removes the ad and the upsell together. The ad
+element itself is further gated on `qt(e.featureFlag) && t`, where `t` is
+`window.electron.isOverwolf()`: this build is `3.7.25-ow`, so `t` is always true, which is
+why the slot is live here at all.
+
+The ad metadata comes from the server (`metadata.ads`), so without this patch the slot only
+renders when Lunar's own backend sends an entry whose `start_time` has passed and whose
+`end_time` has not.
+
+There is a hidden setting, `bypass-lunar-plus-ad-exemption`, but it is **not** a kill
+switch — `bn` (`useShowAd`) returns `o(!0)` the moment it is set, forcing the ad *on*. It
+is a dev backdoor for previewing the slot.
+
+### The window title
+
+`<title>Home - Lunar Client</title>`. The `Home` prefix is not composed at runtime: the
+renderer never calls a title setter (`document.title` matches nothing in `dist/`, and every
+`setTitle` in the asar is a Lexical `Node` method or a protobuf field). The tag is the only
+place the title is authored, so patching it is sufficient.
+
+### The boot splash
+
+`#loading-logo` is an inline base64 webp — Lunar's own logo, shown for the duration of the
+load. Its `opacity:.9` is blanked rather than the image deleted, because the base64 blob
+would not round-trip to a fixed length.
+
+### The four sites
+
+| site | file | find → repl |
+|---|---|---|
+| `ad.upsell-gate` | `use-show-ad.js` | `if(!(a&&e.willShowAd))return null;` → `if(!(!1/*xxxxxxxxx*/))return null;` |
+| `brand.window-title` | `main.html` | `<title>Home - Lunar Client</title>` → `<title>Home - Ratman4080  </title>` |
+| `brand.boot-logo` | `main.html` | `height:auto;opacity:.9;` → `height:auto;opacity:0 ;` |
+| `brand.logo-alt` | `main.html` | `alt="Lunar Client"` → `alt="Ratman4080  "` |
+
+The comment filler in `ad.upsell-gate` and the trailing spaces in the other three exist
+purely to hold the byte count. `!1/*xxxxxxxxx*/` is `false`, so the guard becomes
+`if(true) return null;`.
+
+### The bug this stage hit, and the fix
+
+The first implementation spliced through a decoded string. It balanced — Apply and Revert
+reported the same size and all four sites verified — but **Revert did not return the
+original hash**: `4334600f` → patched → `5102388c`, at an identical 25,797,518 bytes.
+
+The cause is that these bundles are not uniformly UTF-8. .NET's `UTF8.GetString` does not
+throw on an invalid sequence; it substitutes `U+FFFD`, which re-encodes as three bytes.
+Length is preserved, so every length assertion still passed, while the bytes silently
+differed.
+
+The fix is to splice on bytes and never decode the file. Verified on a disposable copy of
+the live asar:
+
+| | sha256 (first 8) | size |
+|---|---|---|
+| original | `4334600f` | 25,797,518 |
+| after `Apply` | `018f079d` | 25,797,518 |
+| after `Revert` | `4334600f` | 25,797,518 |
+
+Revert is now byte-identical to the original, so it needs no backup — though the first
+`Apply` still writes `app.asar.stage4.pristine` as a safety net.
+
+### Usage
+
+```bat
+patch-ui.cmd
+```
+
+or, for the modes directly:
+
+```powershell
+.\patch-ui.ps1 -Mode Status   # read-only; safe with the launcher open
+.\patch-ui.ps1 -Mode Apply    # refuses to run while Lunar Client is running
+.\patch-ui.ps1 -Mode Revert   # exact inverse
+```
+
+Each run re-reads the header from disk, requires **exactly one** occurrence of each source
+span, asserts every site is net-zero, asserts the asar size is unchanged, and then
+re-verifies all four spans from the file it just wrote.
+
+### Limits
+
+* **The live asar was not patched during this stage's build** — the launcher was open, and
+  `Apply` correctly refuses on a live path. Run `patch-ui.cmd` once with Lunar closed; the
+  sandbox copy above is what carries the proof.
+* **This is not a full rebrand.** The in-app strings — `Login with Microsoft`,
+  `No ownership`, the Store copy — are i18n entries inside
+  `/dist-electron/electron/main.js` (5,754,280 bytes), numbering in the hundreds. Stage 4
+  changes the title bar, the boot splash and the ad slot; it does not touch the i18n table.
+* **The updater replaces the asar**, so a new build reverts all four sites. Re-run
+  `patch-ui.cmd`; nothing here is build-specific in the way stage 3's obfuscated names are,
+  but the anchors should be re-confirmed against a new `main.html`.
+* The two trailing spaces in the patched title and alt text are visible in the raw bytes.
+  They are deliberate — removing them would need a header rebuild.
