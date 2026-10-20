@@ -19,3 +19,7 @@ sim/
 *.png
 sb_out.txt
 sb_err.txt
+
+# python bytecode
+__pycache__/
+*.pyc
