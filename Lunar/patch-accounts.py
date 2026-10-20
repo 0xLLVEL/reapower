@@ -136,14 +136,13 @@ METHOD_BODY = (
 PRELOAD_FIND = "_={async addAccount(){return await u.ipcRenderer.invoke(`auth:addAccount`)}"
 PRELOAD_REPL = "_={async addAccount(e){return await u.ipcRenderer.invoke(`auth:addAccount`,e)}"
 
-# Relative, matching how the bundle references its own entry - the other tags are
-# "../assets/main.js", not "/dist/assets/main.js". An absolute src on a file:// origin
-# resolves against the filesystem root and 404s, so the module never runs at all.
+# A classic script, not type="module": the file has no imports or exports, so module
+# semantics buy nothing and only add defer timing and module-CORS as ways to fail
+# silently. Relative, matching how main.html references its own bundle - an absolute src
+# on a file:// origin resolves against the filesystem root and 404s, which is how the
+# first revision never ran at all.
 HTML_FIND = "</body>"
-HTML_REPL = (
-    '<script type="module" crossorigin src="../assets/rat-accounts.js"></script>'
-    "</body>"
-)
+HTML_REPL = '<script src="../assets/rat-accounts.js"></script>' + "</body>"
 
 
 def main():
@@ -194,10 +193,19 @@ def main():
         "/dist/html/main.html": html.encode("utf-8"),
     }
 
-    # put the module in the tree, then rewrite every embedded file in one pass
+    # put the module in the tree, then rewrite every embedded file in one pass.
+    #
+    # The new entry MUST be in `replacements`. emit() treats anything absent as an
+    # existing file and slices it out of the old data section at whatever offset the tree
+    # carries - a fresh node was given offset "0", so it read the first N bytes of the
+    # packed bundle instead. That N is close to the module's length, so size, offset,
+    # tree shape and every spliced file all verified clean while the entry held the head
+    # of an unrelated asset. Three installs shipped a PNG behind this tag before the
+    # content was read back and the signature spotted.
     files, name = ensure_dir(tree, ENTRY_MODULE)
     if name in files and "files" in files[name]:
         raise SystemExit("entry path is a directory")
+    replacements[ENTRY_MODULE] = module
     files[name] = {"size": len(module), "offset": "0"}
 
     # snapshot every original file before emit() rewrites the offsets in place - the
@@ -274,6 +282,22 @@ def main():
             diffs.append((p, "content"))
 
     added = sorted(set(e2) - set(originals))
+
+    # The new file has no counterpart to compare against, so its bytes are checked
+    # against what was meant to be written. Absence of a diff elsewhere says nothing
+    # about whether this entry landed - which is exactly how a PNG got installed here.
+    if ENTRY_MODULE in e2:
+        got = e2[ENTRY_MODULE]
+        if got == module:
+            print("  module content     : OK   %d bytes, sha %s" % (len(got), sha8(got)))
+        else:
+            print("  module content     : WRONG  expected %d bytes sha %s" % (len(module), sha8(module)))
+            print("                       got      %d bytes sha %s" % (len(got), sha8(got)))
+            print("                       first 16 bytes: %r" % got[:16])
+            diffs.append((ENTRY_MODULE, "module-content"))
+    else:
+        print("  module content     : MISSING")
+        diffs.append((ENTRY_MODULE, "module-missing"))
 
     print("  entries            : %d  (was %d)" % (len(e2), len(originals)))
     print("  added              : %s" % (", ".join(added) or "none"))
