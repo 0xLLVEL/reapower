@@ -64,6 +64,7 @@ stage2-status.cmd    report the asar build, the 2 main.js spans and accounts.jso
 patch-stage2.cmd     back up app.asar + accounts.json, write the 2 spans, verify by sha
 revert-stage2.cmd    restore the pristine app.asar + accounts.json from backup
 
+account-manager.ps1  list / show / add / use / remove / refresh / validate the accounts
 mod\                 stage 3 source; build -> rat-cosmetics.jar (see §9)
 ```
 
@@ -573,6 +574,77 @@ The cost of the 12-hour ceiling is honest and small: re-run `patch-stage2.cmd` w
 `-Mode Stage2Status` reports the window has expired, or the launcher will attempt the
 refresh that `INVALID_SESSION` blocks.
 
+### Managing the accounts
+
+`account-manager.ps1` operates on the same file, and every constraint it enforces comes from
+the bytecode above — it is not opinion, it is `load()` reading the file.
+
+| Mode | Effect |
+|---|---|
+| `List` | table of every account: active marker, expiry window and time left, v4 check, refresh token, uuid, key |
+| `Show -Name X` | one account in full, plus its violations |
+| `Add -Name X` | new account: random v4 uuid, random v4 `localId`/`remoteId`, expiry `now + $ExpiresHours` |
+| `Use -Name X` | set `activeAccountLocalId` |
+| `Remove -Name X` | delete; reassigns `active` to another account; refuses to remove the last one |
+| `Refresh [-Name X]` | set expiry to `now + $ExpiresHours` |
+| `Validate` | violations only, and **throws** on any `FAIL` so it is scriptable |
+| `Backup` / `Restore` | snapshot to `%LOCALAPPDATA%\LunarPatch\backup\accounts.manager.json` |
+
+`-ExpiresHours` defaults to 12. `-AccountsPath` and `-BackupDir` default to the live file and
+the real backup dir; pointing both at a directory makes the whole thing a sandbox, which is
+how every mode above was tested — the live file was never written during verification.
+
+Writing modes refuse to run while `Lunar Client.exe` is up **when the target is the live
+file**. The launcher rewrites `accounts.json` on exit, so a write racing it is lost; a
+sandbox copy cannot be raced by anything, so it is allowed at any time.
+
+#### The schema is the launcher's output, not the script's
+
+`patch-stage2.cmd` stamps `"userProperties": []` into `accounts.json` and puts `accounts`
+first. The live file has no `userProperties` at all and puts `activeAccountLocalId` first —
+because `hEe`/`mEe` parse it and re-serialise it, and the valibot mask silently drops keys it
+does not know. So the file Lunar writes is the ground truth for what the file must contain,
+and `account-manager.ps1` emits exactly that shape, round-trip stable.
+
+#### Violation codes
+
+`List` and `Validate` report them; only `FAIL` blocks.
+
+| Code | Severity | Consequence |
+|---|---|---|
+| `(2).window` | FAIL | expiry past `now + 14d` → `load()` removes the account before `map.put`, and the next flush writes `{"accounts": {}}` |
+| `profile.id.shape` | FAIL | not 32 lowercase hex → the valibot mask discards the whole file |
+| `profile.missing` | FAIL | no `minecraftProfile` → same |
+| `username.empty` | FAIL | the dup check and the load log both key on it |
+| `key.localid` | FAIL | map key does not equal `localId` |
+| `active.missing` / `active.dangling` | FAIL | no usable `activeAccountLocalId` |
+| `expiry.past` | WARN | `executeWithAccessToken` fires `refreshAccountInternal` → `INVALID_SESSION` |
+| `profile.id.notv4` | WARN | `mN()` will not strip dashes → `getAccount()` misses → `SR.NO_ACCOUNT` |
+| `refresh.empty` | WARN | `initAuthInternal` sets `invalid: !e.refreshToken`; the UI flags the account |
+| `name.mismatch` | WARN | `username` != `minecraftProfile.name` |
+
+#### `patch-stage2.cmd` no longer destroys them
+
+Recovering from an updater run means re-running `patch-stage2.cmd`, which used to write its
+template over `accounts.json` unconditionally — silently deleting anything the manager had
+added. `Write-Accounts` now stamps the template **only** into a file that is missing,
+unparseable or empty, which is the state a pristine install starts in and the state
+`Stage2Revert` restores. Whatever is already there is kept, and only accounts whose expiry
+has fallen outside `(now, now + 14d]` are refreshed.
+
+Re-verified on a sandbox, live files untouched:
+
+| Step | asar sha | accounts |
+|---|---|---|
+| start | `40c41720` | 0 |
+| `Stage2Apply` | `4334600f` | 1 |
+| `Stage2Revert` | `40c41720` | 0 |
+| `Stage2Apply` | `4334600f` | 1 |
+
+and with 2 accounts present, one of them poisoned to `2099-12-31T23:59:59.999Z`: 2 in, 2
+out, the poisoned one refreshed to `now + 12h`, the in-window one untouched, asar sha still
+`4334600f`.
+
 ### What stage 2 buys, stated plainly
 
 | | |
@@ -732,8 +804,11 @@ OK ids=[3, 2424, 894] uuid=9f8e7d6c-5b4a-4928-9706-f5e4d3c2b1a0
 as soon as the client is up. `OK` is written only after **both** calls return, and the log
 dedupes by message so it never spams.
 
-The UUID is read from `accounts.json` (`minecraftProfile.id`, dashed by regex) rather than
-hard-coded, so changing `$S2AccountId` does not break the mod. The protobuf builders are
+The UUID is read from `accounts.json` through Gson rather than hard-coded, so changing
+`$S2AccountId` does not break the mod — and with `account-manager.ps1` in play it resolves
+through `activeAccountLocalId`, falling back to the first entry only when that key is
+absent or dangling. A first-match regex would inject cosmetics for whichever account
+happens to serialise first, not the one Lunar actually launched. The protobuf builders are
 public API and called directly — only the obfuscated Lunar internals go through reflection,
 with `getMethod` first and a `getDeclaredMethod` + `setAccessible` walk up the superclass
 chain as fallback, since their access flags are not knowable without checking every build.

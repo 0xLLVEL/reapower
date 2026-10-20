@@ -1,5 +1,7 @@
 package rat.cosmetics;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.lunarclient.common.v1.Color;
 import com.lunarclient.common.v1.Uuid;
 import com.lunarclient.websocket.cosmetic.v2.EquippedCosmetic;
@@ -18,8 +20,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class RatCosmetics implements ClientModInitializer {
 
@@ -31,9 +31,6 @@ public class RatCosmetics implements ClientModInitializer {
     private static final Path IDS_FILE = GAME.resolve("rat-cosmetics.txt");
     private static final Path LOG_FILE = GAME.resolve("rat-cosmetics.log");
     private static final Path ACCOUNTS = GAME.resolve("accounts.json");
-
-    private static final Pattern PROFILE_ID = Pattern.compile(
-        "\"minecraftProfile\"\\s*:\\s*\\{\\s*\"id\"\\s*:\\s*\"([0-9a-fA-F]{32})\"");
 
     private static final int[] FALLBACK_IDS = { 3, 2424, 894 };
 
@@ -140,16 +137,37 @@ public class RatCosmetics implements ClientModInitializer {
 
     private static UUID readUuid() {
         try {
-            String s = new String(Files.readAllBytes(ACCOUNTS), StandardCharsets.UTF_8);
-            Matcher m = PROFILE_ID.matcher(s);
-            if (!m.find()) {
+            String src = new String(Files.readAllBytes(ACCOUNTS), StandardCharsets.UTF_8);
+            JsonObject doc = JsonParser.parseString(src).getAsJsonObject();
+            JsonObject accounts = doc.has("accounts")
+                ? doc.getAsJsonObject("accounts") : null;
+            if (accounts == null || accounts.size() == 0) {
                 return null;
             }
-            String h = m.group(1);
+
+            JsonObject acc = null;
+            if (doc.has("activeAccountLocalId")) {
+                String active = doc.get("activeAccountLocalId").getAsString();
+                if (!active.isEmpty() && accounts.has(active)) {
+                    acc = accounts.getAsJsonObject(active);
+                }
+            }
+            if (acc == null) {
+                acc = accounts.getAsJsonObject(accounts.keySet().iterator().next());
+            }
+            if (!acc.has("minecraftProfile")) {
+                return null;
+            }
+
+            String h = acc.getAsJsonObject("minecraftProfile")
+                .get("id").getAsString().replace("-", "");
+            if (h.length() != 32) {
+                return null;
+            }
             return UUID.fromString(
                 h.substring(0, 8) + "-" + h.substring(8, 12) + "-" + h.substring(12, 16)
                     + "-" + h.substring(16, 20) + "-" + h.substring(20, 32));
-        } catch (Exception e) {
+        } catch (Throwable t) {
             return null;
         }
     }

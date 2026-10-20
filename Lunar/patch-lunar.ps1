@@ -13,6 +13,25 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Path defaults are spelled out in the param block (which has to stay the first statement),
+# so restate them here: these decide whether Lunar being open actually matters. It only does
+# for the live files - a launcher already running cannot race a sandbox copy.
+$LiveExe      = Join-Path $env:LOCALAPPDATA 'Programs\Lunar Client\Lunar Client.exe'
+$LiveAsar     = Join-Path $env:LOCALAPPDATA 'Programs\Lunar Client\resources\app.asar'
+$LiveAccounts = Join-Path $env:USERPROFILE '.lunarclient\settings\game\accounts.json'
+
+function Test-LivePath
+{
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $false }
+    try { $full = [IO.Path]::GetFullPath($Path) } catch { return $false }
+    foreach ($live in @($LiveExe, $LiveAsar, $LiveAccounts))
+    {
+        if ($full -eq [IO.Path]::GetFullPath($live)) { return $true }
+    }
+    return $false
+}
+
 $PristineSha = 'c1d3f36dba310629aedec239b6c55a2f1cfe21e6930dff2ee0440c169718628e'
 $PatchedSha = 'cc94512fa4ac83d88a1eea94a24d8d066d037f411b96cf7d23cb3eca3a3c36d7'
 $FuseMarker = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'
@@ -71,6 +90,7 @@ $S2LocalId     = '7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4'
 # Window is (now - 14d, now + 14d]. Use +12h: it mimics a live token and stays clear of any
 # isBefore(now) "expired" branch that would fire a RefreshAccount the launcher cannot satisfy.
 $S2ExpiresAt   = (Get-Date).ToUniversalTime().AddHours(12).ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z'
+$S2WindowDays  = 14
 $S2AccountsNew = @"
 {
   "accounts": {
@@ -361,8 +381,52 @@ function Write-Accounts
     }
     $dir = Split-Path -Parent $AccountsPath
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    [IO.File]::WriteAllText($AccountsPath, $S2AccountsNew)
-    Write-Output ("accounts : {0}" -f $AccountsPath)
+
+    # Preserve whatever is already there. account-manager.ps1 may have added accounts, and
+    # stamping the template over the top would silently destroy them - which matters because
+    # "re-run patch-stage2.cmd after every update" is the documented recovery path. The
+    # template is only written into a file that is missing, unparseable or empty, which is
+    # the state a pristine install starts in and the state Stage2Revert restores.
+    $keep = $null
+    if (Test-Path $AccountsPath)
+    {
+        try { $keep = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($AccountsPath)) | ConvertFrom-Json } catch { $keep = $null }
+    }
+    $entries = @()
+    if ($null -ne $keep -and $null -ne $keep.accounts)
+    {
+        foreach ($p in $keep.accounts.PSObject.Properties) { $entries += $p }
+    }
+
+    if ($entries.Count -eq 0)
+    {
+        [IO.File]::WriteAllText($AccountsPath, $S2AccountsNew)
+        Write-Output ("accounts : {0}  1 entry written" -f $AccountsPath)
+        return
+    }
+
+    # Keep the accounts, but bring every expiry back inside the load() window: outside
+    # (now, now+14d] the account is either rejected with (2) or triggers a refresh that a
+    # fake refresh token cannot satisfy.
+    $now = (Get-Date).ToUniversalTime()
+    $bumped = 0
+    foreach ($p in $entries)
+    {
+        $exp = $null
+        try { $exp = ([datetime]$p.Value.accessTokenExpiresAt).ToUniversalTime() } catch { }
+        $outside = ($null -eq $exp) -or ($exp -le $now) -or ($exp -gt $now.AddDays($S2WindowDays))
+        if ($outside) { $p.Value.accessTokenExpiresAt = $S2ExpiresAt; $bumped++ }
+    }
+
+    if (-not $keep.PSObject.Properties['activeAccountLocalId'] -or -not $keep.activeAccountLocalId)
+    {
+        $entry = [pscustomobject]@{ Name = $entries[0].Name }
+        if ($keep.PSObject.Properties['activeAccountLocalId']) { $keep.activeAccountLocalId = $entry.Name }
+        else { $keep | Add-Member -NotePropertyName activeAccountLocalId -NotePropertyValue $entry.Name }
+    }
+
+    [IO.File]::WriteAllText($AccountsPath, ($keep | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+    Write-Output ("accounts : {0}  {1} kept, {2} expiry refreshed" -f $AccountsPath, $entries.Count, $bumped)
 }
 
 function Invoke-Stage2
@@ -370,7 +434,7 @@ function Invoke-Stage2
     param([string]$Requested)
 
     if (-not (Test-Path $AsarPath)) { throw ("target not found: {0}" -f $AsarPath) }
-    if ($Requested -ne 'Stage2Status' -and (Get-Process -Name 'Lunar Client' -ErrorAction SilentlyContinue)) { throw 'Lunar Client is running - close it first' }
+    if ($Requested -ne 'Stage2Status' -and ((Test-LivePath $AsarPath) -or (Test-LivePath $AccountsPath)) -and (Get-Process -Name 'Lunar Client' -ErrorAction SilentlyContinue)) { throw 'Lunar Client is running - close it first' }
 
     $bytes = [IO.File]::ReadAllBytes($AsarPath)
     $sha = [LP]::Sha256Bytes($bytes)
@@ -495,7 +559,7 @@ if ($Mode -eq 'Status')
     return
 }
 
-if (Get-Process -Name 'Lunar Client' -ErrorAction SilentlyContinue)
+if ((Test-LivePath $ExePath) -and (Get-Process -Name 'Lunar Client' -ErrorAction SilentlyContinue))
 {
     throw 'Lunar Client is running - close it first'
 }
