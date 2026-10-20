@@ -155,6 +155,11 @@ METHOD_BODY = (
 ACCOUNT_ID_FIND = ".find(t=>t.minecraftProfile.id===mN(e))"
 ACCOUNT_ID_REPL = ".find(t=>mN(t.minecraftProfile.id)===mN(e))"
 
+# `initAuthInternal` flags every profile invalid when it has no refreshToken. Our
+# accounts never have one, so both of them always loaded as invalid.
+INVALID_FIND = "invalid:!e.refreshToken"
+INVALID_REPL = "invalid:!1"
+
 PRELOAD_FIND = "_={async addAccount(){return await u.ipcRenderer.invoke(`auth:addAccount`)}"
 PRELOAD_REPL = "_={async addAccount(e){return await u.ipcRenderer.invoke(`auth:addAccount`,e)}"
 
@@ -215,6 +220,35 @@ def main():
         % ("accounts.id", len(ACCOUNT_ID_REPL) - len(ACCOUNT_ID_FIND), n_id)
     )
     mainjs = mainjs.replace(ACCOUNT_ID_FIND, ACCOUNT_ID_REPL)
+
+    # A missing refreshToken makes a profile invalid, and invalidity is not cosmetic.
+    #
+    # It shows as the red "Reauthenticate Now" banner, and the account row in the switch
+    # submenu routes away from switching entirely:
+    #
+    #   onClick: () => { if (!loading) { if (invalid) { openMicrosoftLogin(); return }
+    #                                      || a(e.uuid, e.username) } }
+    #
+    # so clicking a local account opened the real Microsoft sign-in window instead of
+    # switching to it. Both symptoms came from this one line, which is why switching
+    # appeared to work and then misbehaved rather than failing outright.
+    #
+    # A refreshToken in the record would also have cleared the flag, but that is the
+    # field the refresh path reads, so putting a fake one there would arm a network call
+    # for the day the expiry lapses. The flag is what actually gates the UI, so the flag
+    # is what gets closed.
+    #
+    # `invalidateAccount` is the only other writer of this field, it dispatches invalid:!0
+    # on a real auth failure, and it is reached only from the catch in initAuthInternal
+    # when the code is one of INVALID_SESSION / NO_OWNERSHIP / NO_MULTIPLAYER_ACCESS /
+    # BANNED / ACCOUNT_EDIT_RACE_CONDITION. Ownership is already closed at stage 2 and the
+    # privilege and ban checks read attributes we deliberately leave undefined, so that
+    # catch is not reachable from a local account.
+    n_inv = mainjs.count(INVALID_FIND)
+    if n_inv != 1:
+        raise SystemExit("accounts.invalid: %d occurrence(s), expected 1" % n_inv)
+    print("  %-22s %+d B  profile no longer flagged invalid" % ("accounts.invalid", len(INVALID_REPL) - len(INVALID_FIND)))
+    mainjs = mainjs.replace(INVALID_FIND, INVALID_REPL)
 
     preload = read_entry("/dist-electron/preload/launcher/index.js").decode("utf-8")
     preload = splice(preload, PRELOAD_FIND, PRELOAD_REPL, "preload.auth")

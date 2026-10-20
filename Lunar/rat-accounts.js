@@ -196,7 +196,9 @@ function inject() {
   const item = document.createElement("div");
   item.className = MARK + "-item";
   item.setAttribute(MARK, "1");
-  item.innerHTML = '<span class="' + MARK + '-dot">&#8250;</span><span>' + LABEL + "</span>";
+  // The marker is a bullet, not an arrow. A `&#8250;` chevron reads as a submenu that
+  // opens on hover, and this row opens a dialog instead.
+  item.innerHTML = '<span class="' + MARK + '-dot">&#9679;</span><span>' + LABEL + "</span>";
   item.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
