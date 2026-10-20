@@ -39,6 +39,7 @@ disk outside the `mods` folder.
 8. [Stage 2 — the Minecraft ownership gate](#8-stage-2--the-minecraft-ownership-gate)
 9. [Stage 3 — cosmetics without the AssetServer](#9-stage-3--cosmetics-without-the-assetserver)
 10. [Stage 4 — branding, and the ad slot](#10-stage-4--branding-and-the-ad-slot)
+11. [Stage 5 — an in-launcher account entry point](#11-stage-5--an-in-launcher-account-entry-point)
 
 ---
 
@@ -998,3 +999,135 @@ re-verifies all four spans from the file it just wrote.
   but the anchors should be re-confirmed against a new `main.html`.
 * The two trailing spaces in the patched title and alt text are visible in the raw bytes.
   They are deliberate — removing them would need a header rebuild.
+
+---
+
+## 11. Stage 5 — an in-launcher account entry point
+
+Adds **Add Cracked Account** to the launcher's own account dropdown, sitting directly
+beneath the shipped **Add Account** row. It opens a small form, takes a username, and
+writes the account through the launcher's real store — so the account appears in that
+same menu, becomes switchable, and launches.
+
+### The bridge is `window.lunar`, not `window.electron`
+
+Easy to get wrong, and everything downstream depends on it. The preload exposes two
+objects:
+
+| world key | contents |
+|---|---|
+| `window.electron` | `ipcRenderer`, `clipboard`, `isPackaged`, `isOverwolf`, `redux`, `webUtils` |
+| `window.lunar` | `analytics`, `auth`, `badge`, `badlion`, `cache`, `friends`, `installs`, `launch`, … |
+
+Account calls go through `window.lunar.auth`. The `p` set in the preload is a
+**listener** allowlist only — it gates `on`/`once`/`removeListener`. `invoke` is not
+allowlisted at all; each method hard-codes its own channel, which is why the preload has
+to change for the payload to travel.
+
+### Why this stage could not stay net-zero
+
+Stages 2 and 4 preserved length, which is why the asar header never had to be rebuilt.
+Stage 5 only adds: `+51` in the handler, `+338` for the new method, `+3` in the preload,
+`+78` for the script tag, plus a new `7,831`-byte module. An entry's offset is absolute
+within the data section, so growing `main.js` moves every file packed after it — every
+offset has to be recomputed and the header rewritten.
+
+### The repacker, and how it was proved lossless
+
+`asar_repack` was tested before it was trusted. Round-tripping `main.js` back into the
+asar **as its own identical bytes** produced a rebuilt container in which **all 1286
+embedded files read back byte-identical, with zero differences**. That is the proof the
+header rewrite is correct; the rebuild is not taken on faith.
+
+The rebuilt asar is `1,866` bytes larger than the original for that no-op. The cause is
+in `inspect`: the original reports **offset alignment of 1** and a **negative minimum
+gap**, which means the offsets are neither 4-aligned nor in tree order. The original
+builder **deduplicates identical file contents by pointing several entries at one
+offset**; the rebuild gives each entry its own copy. Larger, still correct.
+
+### The add path
+
+Nothing here writes `accounts.json`. The call goes through the launcher's own store, so
+the file on disk and the state the launcher holds cannot drift — the failure mode that
+makes `account-manager.ps1` insist on a closed launcher.
+
+```
+window.lunar.auth.addAccount({ username })
+  -> ipcRenderer.invoke("auth:addAccount", payload)
+  -> the patched handler in ZAe.onSetup        (event, payload) -> (e, t)
+  -> ZAe.addLocalAccount(t)
+  -> _Ee(profileId, name, accessToken, expiresAt, undefined, "Xbox", remoteId, localId)
+       writes accounts.json, sets activeAccountLocalId
+  -> store.dispatch(KAe({uuid, username, localId, loading:false, invalid:false}))
+       updates the in-memory profile list so the menu refreshes
+```
+
+`ipcMain.handle` passes the renderer's payload as the **second** argument and the
+`IpcMainInvokeEvent` as the first, which is why the signature becomes `(e,t)` and not
+`(e)`. With no payload the handler falls through to the original Microsoft flow, so the
+unmodified **Add Account** row behaves exactly as shipped.
+
+Three details in `addLocalAccount` are load-bearing:
+
+* **`profileId` is a v4 UUID.** The launch path normalises through `mN()`, which only
+  rewrites a UUID that already passes the v4 test; a value it does not recognise leaves
+  `getAccount()` missing and the launch dead with `SR.NO_ACCOUNT`.
+* **Expiry is `now + 12h`**, matching stage 2. A past date triggers the refresh path and
+  comes back `INVALID_SESSION`; anything past the 14-day window is rejected outright.
+* **`Xbox` is a literal, not `gEe.Xbox`.** The enum sits thousands of bytes away in the
+  bundle and its scope relative to this class is not knowable without running it, while
+  the value is a plain string in the account record.
+
+### The four sites, and the one new file
+
+| site | file | change |
+|---|---|---|
+| `accounts.handler` | `dist-electron/electron/main.js` | `async()=>` → `async(e,t)=>`, plus the `if(t&&t.username)` branch |
+| `accounts.method` | `dist-electron/electron/main.js` | `addLocalAccount` inserted ahead of `addAccount(e)` |
+| `accounts.bridge` | `dist-electron/preload/launcher/index.js` | `addAccount()` → `addAccount(e)`, payload passed through |
+| `accounts.script` | `dist/html/main.html` | `<script type="module" src="/dist/assets/rat-accounts.js">` |
+| — | `dist/assets/rat-accounts.js` | new, 7,831 B |
+
+The module never touches the React tree. It watches the DOM for the launcher's own row
+by **exact text match**, which is what keeps it from catching **Add Account (via
+Link)**, and re-injects on mutation because React replaces menu nodes on every state
+change. A re-render costs a re-injection rather than a broken tree.
+
+### Verified, and not verified
+
+Verified before installation:
+
+* asar rebuilt to `c45d7f71`, `25,805,871` bytes, **1287 entries** (was 1286)
+* exactly **3 files differ**, and those are the three this patcher splices — nothing else
+  moved, which is what a lost byte would look like
+* all three JavaScript files pass `node --check` (`node v26.12.0`)
+
+**Not verified: runtime.** The launcher has not been started against this asar. The
+splices are syntactically valid and the container is structurally sound, but whether
+`addLocalAccount` resolves every identifier it names — `R`, `Buffer`, `mN`, `_Ee`,
+`KAe`, `Z` — is only settled by opening the launcher.
+
+### Usage
+
+Close Lunar, then either install the rebuilt asar or rebuild in place, and open the
+launcher. The account dropdown now carries a second entry.
+
+Revert is the stage-4 backup path:
+
+| file | role |
+|---|---|
+| `app.asar.stage4.pristine` | `4334600f`, before stage 4 |
+| `app.asar.stage4.applied` | `018f079d`, stage 4 in place, stage 5 absent |
+
+Restoring either and re-running `patch-ui.cmd` / this patcher returns a known state.
+
+### Limits
+
+* **Runtime is unconfirmed.** Treat the first launch as the test it is.
+* The menu item appears wherever the launcher renders the exact **Add Account** row. A
+  build that rewords it moves the anchor and the item silently stops appearing.
+* **Switching** needs no new code — once an account is in the store the shipped
+  **Switch Account** submenu handles it. Only *adding* needed a path.
+* The updater replaces the asar. Re-run the patcher; the anchors should be re-confirmed
+  against a new `main.js`, since the handler text is minifier output and a different
+  bundler run will rename `t`, `e` and `x_`.
