@@ -152,6 +152,35 @@ METHOD_BODY = (
     "async addAccount(e){"
 )
 
+# The game rewrites accounts.json and drops the active pointer on the way out.
+#
+# The launcher's own last save was 13:34:29.950, logged by vEe on the switch to
+# kontolodon. The file's mtime is 13:44:30.416 - ten minutes later, with no launcher log
+# entry at that time - and by then activeAccountLocalId is gone and the key order has
+# changed. The writer is game-side: com/moonsworth/lunar/client/
+# IHCOHRRIIRROCRRRRRHCOCROIOCOII/HHIHOIHCIIOCRIHCRHCCIHICRRRCRR/RRRRRIRCCIIORHHCCCHICOCRRCOOOH
+# in lunar.jar carries "Removed all accounts", "Loaded content for" and accounts.json
+# alongside java/nio/file/Files, createNewFile and "Could not write to file: %s".
+#
+# jR serialises with JSON.stringify, and a document whose activeAccountLocalId is
+# undefined omits the key entirely - which is why the file reads back with only
+# "accounts". getAccount then falls back to Object.keys(t.accounts)[0], so the account
+# that comes back as active after a game session is whichever one happens to sort
+# first, not the one that was actually in use. Today that lands on the right account by
+# accident; nothing about the ordering guarantees it will again.
+#
+# Re-anchoring at load is the proportionate fix. It reuses vEe, which is the launcher's
+# own switch-and-persist, so the pointer is written through the same path that a user
+# switch would take. The alternative is patching the JVM side, which means editing an
+# obfuscated class inside a 69 MB jar to change behaviour the launcher should be
+# defending itself against anyway.
+REANCHOR_FIND = "let r=n,i=await AR();if(Z.store.dispatch(dW({activeAccountLocalId:r.localId,"
+REANCHOR_REPL = (
+    "let r=n,i=await AR();"
+    "i.activeAccountLocalId||await vEe(n.minecraftProfile.id);"
+    "if(Z.store.dispatch(dW({activeAccountLocalId:r.localId,"
+)
+
 ACCOUNT_ID_FIND = ".find(t=>t.minecraftProfile.id===mN(e))"
 ACCOUNT_ID_REPL = ".find(t=>mN(t.minecraftProfile.id)===mN(e))"
 
@@ -249,6 +278,12 @@ def main():
         raise SystemExit("accounts.invalid: %d occurrence(s), expected 1" % n_inv)
     print("  %-22s %+d B  profile no longer flagged invalid" % ("accounts.invalid", len(INVALID_REPL) - len(INVALID_FIND)))
     mainjs = mainjs.replace(INVALID_FIND, INVALID_REPL)
+
+    n_re = mainjs.count(REANCHOR_FIND)
+    if n_re != 1:
+        raise SystemExit("accounts.reanchor: %d occurrence(s), expected 1" % n_re)
+    print("  %-22s %+d B  active pointer re-anchored at load" % ("accounts.reanchor", len(REANCHOR_REPL) - len(REANCHOR_FIND)))
+    mainjs = mainjs.replace(REANCHOR_FIND, REANCHOR_REPL)
 
     preload = read_entry("/dist-electron/preload/launcher/index.js").decode("utf-8")
     preload = splice(preload, PRELOAD_FIND, PRELOAD_REPL, "preload.auth")
