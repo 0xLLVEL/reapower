@@ -122,12 +122,28 @@ HANDLER_REPL = (
 # thousands of bytes away in the bundle and its scope relative to this class is not
 # knowable without running it, while the value is a plain string in the account record.
 METHOD_ANCHOR = "name}.`),a}async addAccount(e){"
+
+# `accessTokenExpiresAt` has to be an ISO string, not epoch milliseconds. The store
+# re-reads accounts.json through the valibot schema `mEe` on every load, and that field
+# is declared `string()` - a number fails the parse, so the read handler reports
+# "Accounts file is invalid, creating new one..." and replaces the document with an empty
+# map. That is a total wipe of every account, not a rejection of the one being added, and
+# it fires on the NEXT load rather than at the write, which is what made it look like a
+# switch failure. The write itself logs "Successfully added" four seconds before the file
+# is discarded.
+#
+# 13 days, not 12 hours. `executeWithAccessToken` refreshes when this timestamp is before
+# now, and a refresh goes out over the network to a session that cannot be established
+# offline - so a lapsed expiry does not degrade, it makes the account unlaunchable until
+# someone refreshes it. The 14-day ceiling sits on `iat`, which is read out of the token;
+# a random base64url accessToken has no `iat` and the check reads it as null, which
+# passes.
 METHOD_BODY = (
     "name}.`),a}"
     "async addLocalAccount(t){"
     "let n=(0,R.randomUUID)(),"
     "r=Buffer.from((0,R.pseudoRandomBytes)(64)).toString(`base64url`),"
-    "i=Date.now()+432e5,"
+    "i=new Date(Date.now()+11232e5).toISOString(),"
     "o=(0,R.randomBytes)(16).toString(`hex`),"
     "s=mN((0,R.randomUUID)());"
     "return await _Ee(n,t.username,r,i,void 0,`Xbox`,o,s),"

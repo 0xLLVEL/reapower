@@ -89,7 +89,13 @@ $S2LocalId     = '7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4'
 # check, which is why 2099-12-31 was rejected while a real 1-hour MS token passes.
 # Window is (now - 14d, now + 14d]. Use +12h: it mimics a live token and stays clear of any
 # isBefore(now) "expired" branch that would fire a RefreshAccount the launcher cannot satisfy.
-$S2ExpiresAt   = (Get-Date).ToUniversalTime().AddHours(12).ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z'
+# 13 days, not 12 hours. `executeWithAccessToken` refreshes when accessTokenExpiresAt is
+# before now, and that refresh goes out over the network to a session this setup cannot
+# establish - so a lapsed timestamp does not degrade the account, it stops it launching
+# until someone refreshes it. The 14-day ceiling in the load check sits on `iat`, read
+# out of the token, not on this field; `$S2WindowDays` below is what bounds it, and the
+# two are deliberately one day apart.
+$S2ExpiresAt   = (Get-Date).ToUniversalTime().AddDays(13).ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z'
 $S2WindowDays  = 14
 $S2AccountsNew = @"
 {
