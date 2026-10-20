@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "ratcosmetics",
+  "version": "1.0.0",
+  "name": "Rat Cosmetics",
+  "description": "Injects a PlayerCosmeticsPushV2 locally so cosmetics render without the AssetServer JWT.",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["rat.cosmetics.RatCosmetics"]
+  }
+}

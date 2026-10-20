@@ -63,12 +63,20 @@ if ($oldTotal -ne $newTotal) { throw 'internal: stage 2 spans are not net-zero' 
 # AssetServer client dies with SR.NO_ACCOUNT before it ever opens a socket.
 $S2AccountId   = '9f8e7d6c5b4a49289706f5e4d3c2b1a0'
 $S2LocalId     = '7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4'
+# AccountManager.load() rejects an account when accessTokenExpiresAt is MORE than 14 days in
+# the future. Bytecode at 226..243: aload iat; invokestatic Instant.now(); ldc2_w 14; getstatic
+# DAYS; invokevirtual plus; invokevirtual isAfter; ifeq -> accept. plus pops DAYS, 14L then now
+# as RECEIVER, so isAfter runs on iat: iat.isAfter(now.plus(14, DAYS)). It is an anti-tamper
+# check, which is why 2099-12-31 was rejected while a real 1-hour MS token passes.
+# Window is (now - 14d, now + 14d]. Use +12h: it mimics a live token and stays clear of any
+# isBefore(now) "expired" branch that would fire a RefreshAccount the launcher cannot satisfy.
+$S2ExpiresAt   = (Get-Date).ToUniversalTime().AddHours(12).ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z'
 $S2AccountsNew = @"
 {
   "accounts": {
     "$S2LocalId": {
       "accessToken": "stage2-offline-access-token",
-      "accessTokenExpiresAt": "2099-12-31T23:59:59.999Z",
+      "accessTokenExpiresAt": "$S2ExpiresAt",
       "localId": "$S2LocalId",
       "refreshToken": "stage2-offline-refresh-token",
       "minecraftProfile": {

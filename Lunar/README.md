@@ -1,7 +1,7 @@
 # Lunar Client — Integrity Gate + Ownership Gate Unlock
 
 Local patcher for the **Lunar Client launcher** (Moonsworth LLC, `lunarclient` **3.7.25-ow**,
-Electron **42.7.1**). Two stages, both shipped:
+Electron **42.7.1**), plus one Fabric mod. Three stages, all shipped:
 
 * **Stage 1** removes the launcher's self-integrity gate: Electron's *asar-integrity* fuse is
   blown off and the Overwolf `owepm` validator can no longer block startup, so
@@ -10,12 +10,14 @@ Electron **42.7.1**). Two stages, both shipped:
   inside `app.asar\dist-electron\electron\main.js` plus one fake entry in
   `accounts.json`. The launcher then starts as an account that does not exist, shows
   `LAUNCH GAME`, and reaches the end of its auth pipeline.
+* **Stage 3** is a Fabric mod that injects `PlayerCosmeticsPushV2` locally, so cosmetics
+  render without Lunar's AssetServer ever issuing a JWT.
 
-Everything here operates on your own installation, on disk, with no network calls.
-It is an analysis of a shipped native/JS binary and a byte-level patch of it:
-**8 bytes of the 235,252,216-byte exe differ**, and **432 bytes inside the 5,754,280-byte
-`main.js` differ while its total length stays exactly the same** — which is why the asar
-header never has to be rebuilt.
+Stages 1 and 2 operate on your own installation, on disk, with no network calls: an analysis
+of a shipped native/JS binary and a byte-level patch of it — **8 bytes of the
+235,252,216-byte exe differ**, and **432 bytes inside the 5,754,280-byte `main.js` differ
+while its total length stays exactly the same** — which is why the asar header never has to
+be rebuilt. Stage 3 touches nothing on disk outside the `mods` folder.
 
 ---
 
@@ -29,6 +31,7 @@ header never has to be rebuilt.
 6. [Verification](#6-verification)
 7. [Limits](#7-limits)
 8. [Stage 2 — the Minecraft ownership gate](#8-stage-2--the-minecraft-ownership-gate)
+9. [Stage 3 — cosmetics without the AssetServer](#9-stage-3--cosmetics-without-the-assetserver)
 
 ---
 
@@ -46,7 +49,7 @@ header never has to be rebuilt.
 | companion | `integrity.dll` 13,840 B (Overwolf public-key carrier), `owutility.dll` 3,107,984 B (Overwolf Electron Utility 0.0.0.56) — untouched; `resources\app.asar` 25,797,518 B is untouched by stage 1 and is the stage 2 target (sha256 pristine `40C41720…`, patched `4334600F…`) |
 
 A different Lunar build gets different offsets. The matcher fails hard instead of guessing:
-see [§5](#5-the-eight-bytes).
+see [§5](#5-the-patches).
 
 ---
 
@@ -60,12 +63,17 @@ revert.cmd           restore the pristine exe from the backup (sha-checked befor
 stage2-status.cmd    report the asar build, the 2 main.js spans and accounts.json
 patch-stage2.cmd     back up app.asar + accounts.json, write the 2 spans, verify by sha
 revert-stage2.cmd    restore the pristine app.asar + accounts.json from backup
+
+mod\                 stage 3 source; build -> rat-cosmetics.jar (see §9)
 ```
 
 Close the launcher first — the script refuses to touch a running instance.
 
 Both stages are independent but stage 2 is useless without stage 1: with the fuse on,
 any edit to `app.asar` aborts startup before a single line of `main.js` runs.
+
+`patch-stage2.cmd` must be re-run whenever `accessTokenExpiresAt` lapses — it is written as
+`now + 12h`, see [§8](#8-stage-2--the-minecraft-ownership-gate).
 
 ---
 
@@ -96,10 +104,19 @@ any edit to `app.asar` aborts startup before a single line of `main.js` runs.
 
 * Does **not** grant multiplayer on online-mode servers — the server calls
   `sessionserver.mojang.com` itself, and no local patch reaches it.
-* Does **not** unlock Lunar's own network (friends, cosmetics, cloud mods) — Lunar's
-  AssetServer rejects the fake session with `no-account`, every 30 s, harmlessly.
+* Does **not** unlock Lunar's own network (friends, cloud mods) — Lunar's AssetServer
+  rejects the fake session with `no-account`, every 30 s, harmlessly. **Cosmetics is the one
+  exception**: they are not gated by the session at all, so stage 3 restores them locally
+  without defeating that rejection — see [§9](#9-stage-3--cosmetics-without-the-assetserver).
 * Does **not** touch the Authenticode signature, the registry, or anything outside the
   exe, `app.asar`, `accounts.json` and the backup directory.
+
+**Stage 3 does:**
+
+* Fabric mod `rat-cosmetics.jar`, dropped in `profiles\<ver>\mods\fabric-26.3\`. A daemon
+  thread re-injects a synthetic `PlayerCosmeticsPushV2` every 3 s, straight into the two
+  entry points the real AssetServer push would call. Zero network calls — it reads only
+  `bridge$getSession()`, the world, and the local profile.
 
 ---
 
@@ -295,9 +312,54 @@ What the launcher logs also show, and this is expected rather than a problem:
 That is Lunar's own network rejecting the fake session. It is caught, logged, and retried
 with backoff — it never touches the launch path.
 
-**Not yet run:** the game itself through Lunar (downloading the client and starting a
-`javaw` instance). The launcher gate is closed and proven; the game-side session is a
-separate question and one download away.
+### The game — boot, render, main menu
+
+**Run.** The launcher downloads the client, starts a `javaw` against the bundled JRE
+(`%USERPROFILE%\.lunarclient\jre\515e47c1…\zulu25.30.17-ca-jre25.0.1-win_x64`), and the game
+reaches the main menu as **Ratman4080** — account chip, Lunar logo menu, Singleplayer /
+Multiplayer / Discover / Store, `Lunar Client 26.3 (v2.23.5-2643)`.
+
+The `(2)` wall that used to reject the account is gone from `latest.log`, replaced by the
+normal load sequence:
+
+```
+[LC Accounts] Attempting to load account [7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4]
+[LC Accounts] Loaded content for [Ratman4080] Token IAT
+[LC Accounts] Setting currentAccount to what was on disk: Ratman4080
+[LC Accounts] Setting account 'Ratman4080' as the current session.
+[LC Accounts] Removed all accounts [0 count]
+```
+
+The last line is not a failure: `Removed all accounts` reports what was in the map *before*
+the add, and `[0 count]` is why `accounts.json` can legitimately read `{"accounts": {}}`
+— see [§8](#8-stage-2--the-minecraft-ownership-gate).
+
+The game-side session failure that remains is expected and does not block anything playable:
+
+```
+[LC Auth] Invalid Session
+com.mojang.authlib.exceptions.InvalidCredentialsException: ForbiddenOperationException
+  at MinecraftServicesSessionService.joinServer      (retries at 30 s backoff)
+```
+
+That is Mojang's `joinServer` refusing a token that was never issued. It blocks online-mode
+multiplayer only — not the menu, not singleplayer, not `online-mode=false` servers, and not
+cosmetics (§9).
+
+### Stage 3 — cosmetics render
+
+`rat-cosmetics.log`, in order:
+
+```
+NOTREADY root=null                 <- thread woke before the client finished init
+NOTREADY mgr=false disp=false      <- root resolved, child services still coming up
+OK ids=[3, 2424, 894] uuid=9f8e7d6c-5b4a-4928-9706-f5e4d3c2b1a0
+```
+
+`OK` is written only after **both** injection calls return without throwing, and there is no
+`ERR` line. In-game, cosmetic id 3 (*Lunar Client Classic*) renders on the character's back,
+and the nametag badge takes `setLogoColor(0x55FFFF)` — so the dispatcher path and the manager
+handler both landed, not just one.
 
 ---
 
@@ -306,29 +368,38 @@ separate question and one download away.
 * **The updater will undo both stages.** Lunar replaces `Lunar Client.exe` and
   `resources\app.asar` on any new release; re-run `patch-now.cmd` then `patch-stage2.cmd`
   after each update. Both matchers fail hard on an unknown build rather than write at stale
-  offsets.
+  offsets. Stage 3's jar survives an updater run untouched, but a new **Minecraft** version
+  means a new profile directory (`profiles\26\mods\fabric-26.3` → `27\…`), so the jar has to
+  be copied into the new one — and the obfuscated entry-point names in §9 are build-specific
+  and will need re-mining against the new `lunar.jar`.
 * **Authenticode is left as-is.** The exe is still signed with Overwolf/Moonsworth's
   certificate over the *original* bytes, so the signature no longer matches the file on
   disk. Windows does not care for normal execution; SmartScreen may prompt on first run of
   a freshly downloaded copy. `app.asar`'s embedded per-file SHA256 blocks in the asar header
   are also now stale — that is exactly what the blown fuse stops Electron from checking.
 * **The fake account is not a Minecraft account.** It is a launcher-local record. Mojang has
-  never heard of `9f8e7d6c5b4a39281706f5e4d3c2b1a0` and nothing here changes that.
+  never heard of `9f8e7d6c5b4a49289706f5e4d3c2b1a0` and nothing here changes that.
 * **Online-mode multiplayer stays closed.** The server, not the client, calls
-  `sessionserver.mojang.com`. Same for Realms, chat reporting, Mojang-side skins, and
-  anything on Lunar's own network.
+  `sessionserver.mojang.com`. Same for Realms, chat reporting, Mojang-side skins, and the
+  rest of Lunar's own network — cosmetics being the single exception, restored locally by
+  stage 3 rather than by defeating that check.
+* **The account's timestamp has a 14-day shelf life.** `accessTokenExpiresAt` is written as
+  `now + 12h`, because Lunar's `load()` rejects anything more than 14 days ahead of now
+  (§8). After 12 hours the launcher sees a lapsed token and attempts a refresh that cannot
+  succeed — re-run `patch-stage2.cmd` to rewrite it. `-Mode Stage2Status` reports the
+  remaining window.
 * **Re-applying over an already-patched asar is a different code path** than applying over a
   pristine one: the rebuilt segment has to pass the two existing spans *through* instead of
   replacing them. An earlier version of the script dropped them and the net-zero assertion
   caught it before any write (`net-zero violated: rebuilt main.js is 5753848 bytes`). Fixed;
   `-Mode Stage2Apply` is now idempotent and re-verifies to the same `4334600f…` sha.
-* **One observed `accounts.json` wipe.** In a single boot — the one immediately after force-
-  killing seven launcher processes — the launcher came up with `No accounts found, setting to
-  guest mode...` and left `{"accounts": {}}` behind, and quit itself 29 s later. It did not
-  reproduce: a clean re-run polled the file every 3 s for 43 s across a full boot and it
-  never moved off 739 bytes. Treat it as a hazard of killing a live instance rather than a
-  steady state, and check `-Mode Stage2Status` after any unclean shutdown — it reports the
-  entry count, and `0 entry/entries` while the asar reads `PATCHED` means re-run Apply.
+* **The `accounts.json` wipe is the `(2)` reject, not a race.** The mechanism (§8): a
+  rejected account is `remove`d from the map before `map.put` ever runs, so the map stays
+  empty, and the next flush writes out `{"accounts": {}}` — the *correct* serialisation of
+  an empty map. What made it look like a corruption bug is that it happened in the boot
+  right after seven launcher processes were force-killed, which pointed at a race; it does
+  not. `-Mode Stage2Status` reports the entry count, and `0 entry/entries` while the asar
+  reads `PATCHED` means the timestamp went stale — re-run Apply.
 * No scheduled tasks, no watchers, no service, no registry writes — manual mode only.
 
 ---
@@ -358,39 +429,46 @@ Site 1 makes the entitlements check return `true` without leaving the process. S
 the profile/privileges fetch from reaching Mojang at all and hands the pipeline a literal
 built from `accounts.json`. The remaining failure mode is upstream of both:
 `executeWithAccessToken` refreshes the token when `dayjs(accessTokenExpiresAt).isBefore(now)`,
-and `refreshAccountInternal` throws `INVALID_SESSION` when the refresh token is fake — so the
-written account carries `2099-12-31T23:59:59.999Z` and a non-empty `refreshToken` (an empty
-one also makes the UI flag the account invalid, because `initAuthInternal` sets
-`invalid: !e.refreshToken`).
+and `refreshAccountInternal` throws `INVALID_SESSION` when the refresh token is fake. So the
+timestamp must be in the future — but *not* arbitrarily far in the future, because of the
+`(2)` check below. `refreshToken` must also be non-empty: an empty one makes the UI flag the
+account invalid, because `initAuthInternal` sets `invalid: !e.refreshToken`.
 
 ### The fake account
 
 `%USERPROFILE%\.lunarclient\settings\game\accounts.json`, read by `AR()` and masked against
 `hEe` / `mEe` — a shape mismatch is silently replaced with `{"accounts": {}}`, which is why
-the schema is mirrored exactly, including the fields Lunar's own `_Ee` writes:
+the schema is mirrored exactly, including the fields Lunar's own `_Ee` writes. This is the
+live file as `patch-stage2.cmd` writes it:
 
 ```json
 {
+  "activeAccountLocalId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
   "accounts": {
     "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4": {
       "accessToken": "stage2-offline-access-token",
-      "accessTokenExpiresAt": "2099-12-31T23:59:59.999Z",
-      "localId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
-      "refreshToken": "stage2-offline-refresh-token",
-      "minecraftProfile": { "id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0", "name": "Ratman4080" },
-      "remoteId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
-      "type": "Xbox",
-      "username": "Ratman4080",
+      "accessTokenExpiresAt": "2026-10-20T09:21:26.368Z",
       "eligibleForMigration": false,
       "hasMultipleProfiles": false,
       "legacy": false,
       "persistent": true,
-      "userProperties": []
+      "localId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
+      "refreshToken": "stage2-offline-refresh-token",
+      "minecraftProfile": {
+        "id": "9f8e7d6c5b4a49289706f5e4d3c2b1a0",
+        "name": "Ratman4080"
+      },
+      "remoteId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4",
+      "type": "Xbox",
+      "username": "Ratman4080"
     }
-  },
-  "activeAccountLocalId": "7a1f0c3b-5d9e-4f68-a2b7-c1d0e3f5a9b4"
+  }
 }
 ```
+
+`accessTokenExpiresAt` is **not** a constant — `$S2ExpiresAt` computes
+`(now).ToUniversalTime().AddHours(12)` at apply time. The reason for `now + 12h` rather than
+a far-future date is the `(2)` check below; `2099-12-31` fails it.
 
 `minecraftProfile.id` must be 32 lowercase hex — `pN()` dashes it on the way out and `mN()`
 strips it on the way back, and both compare against that shape.
@@ -428,6 +506,73 @@ That is the last wall on this path: `mc-create-session` is the launcher proxying
 before it — local account, entitlements gate, profile gate, WebSocket handshake to
 `wss://authenticator.lunarclientprod.com/launcher-v3` — now succeeds.
 
+### The `(2)` check — why the expiry is `now + 12h`
+
+`AccountManager.load()` has exactly one way to reject an account *after* the schema mask has
+accepted it. Bytecode, `AccountManager` at `cp#216` → `cp#267`, with the success label
+`281` and the reject at `246`:
+
+```
+216  invokevirtual  <acct>.IRHCCOHIOOORRRIRCRIOCHRHCIIORR()  Instant   ; the account's timestamp
+219  astore 9
+221  aload 9
+223  ifnull  -> 281                                 ; null passes outright
+226  aload 9                                        ; receiver: the account timestamp
+228  invokestatic   time/Instant.now()
+231  ldc2_w         14L
+234  getstatic      temporal/ChronoUnit.DAYS
+237  invokevirtual time/Instant.plus(J,TemporalUnit) ; now.plus(14, DAYS)
+240  invokevirtual time/Instant.isAfter(Instant)     ; <acct>.isAfter(now + 14d)
+243  ifeq  -> 281                                    ; false -> accept
+246  ldc   "Account [%s] was invalid (2)"             ; true  -> REJECT
+264  invokevirtual <mgr>.COCHCHCHCIOCIOOCIIIIHCHRORHCIO()  Map   ; accountsMap.remove(<acct>)
+281  ldc   "Loaded content for [%s] Token IAT"        ; accept label
+```
+
+The receiver order is the whole point: `aload 9` pushes the account timestamp *before*
+`now`, `14L` and `DAYS`, so `plus` has `now` as its receiver and `isAfter` has the account
+timestamp as its — reading it as `now.plus(14, DAYS).isAfter(<acct>)` inverts the rule and
+yields a completely different (and unsatisfiable) requirement.
+
+Read straight, the rule is:
+
+> **Reject when `<acct> > now + 14 days`.**
+
+There is no lower bound in this check — a timestamp in the past is fine here. But a past
+timestamp is rejected one stage earlier, by `executeWithAccessToken`'s refresh trigger.
+The usable window is therefore bounded on both ends, and `now + 12h` sits comfortably inside
+it:
+
+| written value | `<acct> > now+14d` → `(2)` | `dayjs(...).isBefore(now)` → refresh | outcome |
+|---|---|---|---|
+| `2099-12-31T23:59:59.999Z` | **yes** | no | rejected, removed |
+| `(now - 30d)` | no | **yes** | `INVALID_SESSION` on refresh |
+| `now + 12h` | no | no | **accepted** |
+
+That first row was the original value shipped in this account, and it is the answer to both
+open questions from §7: the `Account [%s] was invalid (2)` line, and the `accounts.json`
+wipe. The wipe is not a race and not corruption — it is the correct serialisation of a map
+the reject emptied:
+
+```java
+if (iat.isAfter(Instant.now().plus(14, ChronoUnit.DAYS))) {
+    log("Account [%s] was invalid (2)", username);
+    accountsMap.remove(username);   // removed before put is ever reached
+    continue;
+}
+...
+map.put(username, account);        // skipped for the rejected account
+// map is still empty -> next flush writes {"accounts": {}}
+```
+
+`{"accounts": {}}` is exactly what `{"accounts": {}}` should look like when nothing was
+inserted. With `now + 12h` the account reaches the `281` label and the normal load sequence
+runs — see the `Loaded content for [Ratman4080] Token IAT` line in §6.
+
+The cost of the 12-hour ceiling is honest and small: re-run `patch-stage2.cmd` when
+`-Mode Stage2Status` reports the window has expired, or the launcher will attempt the
+refresh that `INVALID_SESSION` blocks.
+
 ### What stage 2 buys, stated plainly
 
 | | |
@@ -436,12 +581,14 @@ before it — local account, entitlements gate, profile gate, WebSocket handshak
 | `LAUNCH GAME` button present, auth pipeline completes | **shipped, verified** |
 | singleplayer, and `online-mode=false` servers | achievable — that is what any offline session gives you |
 | multiplayer on online-mode servers | **not achievable** — the server calls `sessionserver.mojang.com` itself |
-| Lunar AssetServer (friends, cosmetics, cloud mods) | **not achievable** — Lunar's own server rejects the session with `no-account` |
+| cosmetics | **achieved** — but by stage 3, not by this table's mechanism; see §9 |
+| Lunar AssetServer (friends, cloud mods) | **not achievable** — Lunar's own server rejects the session with `no-account` |
 | skin upload to Mojang | **not achievable** — needs a real access token |
 
 Nothing in stage 1 or 2 removes the requirement itself: that is Mojang's server-side
 entitlement check, and the launcher is only the messenger that reports it. What these two
-stages remove is the launcher's willingness to deliver that message.
+stages remove is the launcher's willingness to deliver that message. Stage 3 does not
+defeat any check either — it supplies the payload the check would have authorised.
 
 ### Known behaviour change
 
@@ -456,3 +603,167 @@ ban checks, and the AssetServer handshake.
 `%LOCALAPPDATA%\LunarPatch\backup\app.asar.pristine` (sha-checked first) and
 `accounts.json` from `accounts.json.pristine`. `revert.cmd` does the same for the exe. The
 two stages revert independently.
+
+---
+
+## 9. Stage 3 — cosmetics without the AssetServer
+
+Lunar's cosmetics never arrive as an HTTP fetch. The launcher holds two sockets —
+`pEe()` → `wss://authenticator.lunarclientprod.com/launcher-v3` and
+`AL()` → `wss://websocket.lunarclientprod.com/launcher-v3` — and the second one pushes a
+`PlayerCosmeticsPushV2` protobuf. That push is the *only* thing that populates the
+equipped list. The JWT wall blocks it, which is why cosmetics die while singleplayer
+does not.
+
+But the push handler does not authenticate anything. It takes a protobuf, computes a
+`PlayerState`, puts it in a map, and refreshes the HUD. Nothing in that path touches the
+network. So the wall can be walked around entirely: build the same protobuf locally and
+hand it to the same two methods the socket would have called.
+
+All cosmetic **assets** are already on disk — only the *ownership list* was server-side.
+`%USERPROFILE%\.lunarclient\textures\assets\lunar\cosmetics.json` is a catalog of
+**5,676** items across 20 categories (`cloak` 2688, `hat` 499, `pet` 467, `bandanna` 449,
+`dragon_wings` 419, …), each with an integer `id`.
+
+### Why a Fabric mod and not a jar patch
+
+The game already runs a real Fabric loader — `modrinth.index.json` in
+`lunar-modpack.mrpack` declares `"fabric-loader": "0.19.5"`, and Lunar ships it as an
+in-process fork (Ichor); no `fabric-loader.jar` exists anywhere under `.lunarclient`, and
+`net/fabricmc/api/` has **0** entries in `lunar.jar`. So there is nothing to patch inside
+the jar, but there *is* a mods directory being loaded from. A 5 KB mod on top of that
+classpath is strictly less invasive than rewriting 69 MB of obfuscated bytecode.
+
+### The chain — three hops, all bytecode-confirmed
+
+```java
+// 1. root
+var root = com.moonsworth.lunar.client.util.RHCRCOORHOOCRRHRHCOHHICOHIIIHO
+    .IRHOCRROOOIICOOCRRRIRHICOHICOC();          // invokestatic -> client/RRRRRIRCCIIORHHCCCHICOCRRCOOOH
+
+// 2. both children come off the root, NOT off each other
+root.HHRCCCROHCRHHOCRHCCRRORRIOCCOO();          // -> .../OOCHHCIRCOCHOOOCIOIIHCRIIHRRCH    (manager)
+root.IRHOHHIIHICCIOIIRCCCCCHHIOCCRC();          // -> .../IICRCHHORRHHCIRROCHIRCRIOIORRC    (dispatcher)
+```
+
+The obvious chain — `root → manager → dispatcher` — **does not exist**: the manager declares
+no method returning the dispatcher. It holds one as a field and calls straight into it, which
+is why the first build died with
+`NoSuchMethodException: …OOCHHCIRCOCHOOOCIOIIHCRIIHRRCH.CORRIROORHRIRIHCRHROIOCRCCIOIH`.
+Both getters live on the root; `root_sigs.txt` and the first three instructions of
+`AccountManager.OOICCIRRHICHRHCIICOCCCOOHCHHIH` agree:
+
+```
+0  invokestatic   locator.IRHOCRROOOIICOOCRRRIRHICOHICOC()   -> root
+3  invokevirtual  root.IRHOHHIIHICCIOIIRCCCCCHHIOCCRC()      -> dispatcher
+7  invokevirtual  dispatcher.OOOIHHOCHOROCHCRHHROHCRRCICOOH(UUID)
+```
+
+### The two injection points
+
+Both take a `PlayerCosmeticsPushV2`; both are called repeatedly by production code and are
+safe to call repeatedly (`Map.put` / `Map.compute` overwrite).
+
+```java
+dispatcher.CORRIROORHRIRIHCRHROIOCRCCIOIH(push)             // what the websocket calls; writes the equipped list
+manager   .RRRRRIRCCIIORHHCCCHICOCRRCOOOH(uuid, push, 0)    // PlayerState: logo/plus colours, HUD refresh
+```
+
+The manager handler reads `bridge$getSession()`, returns immediately if null, and otherwise
+computes `isSelf`, extracts RGB from `getLogoColor()`/`getPlusColor()`, does
+`ROOHCRRCOHIOCHHOHRIIHIHIRIIROO().compute(uuid, lambda)` and finishes with a HUD refresh —
+no I/O of any kind.
+
+### Build
+
+```
+mod\
+  src\rat\cosmetics\RatCosmetics.java     the mod
+  stub\net\fabricmc\api\ClientModInitializer.java   compile-only, NOT packaged
+  res\fabric.mod.json
+```
+
+```powershell
+# stub first, into its own directory so it can never reach the output jar
+javac -d mod\stubout mod\stub\net\fabricmc\api\ClientModInitializer.java
+
+# the mod, against lunar.jar + the stub
+javac -cp "C:\Users\<u>\.lunarclient\offline\multiver\lunar.jar;mod\stubout" `
+      -d mod\out mod\src\rat\cosmetics\RatCosmetics.java
+
+# package exactly two entries — the stub's .class must be absent
+#   fabric.mod.json
+#   rat/cosmetics/RatCosmetics.class
+```
+
+`fabric.mod.json` carries no `depends` block on purpose: the loader version is Lunar's own
+fork, and pinning it risks the mod silently not loading.
+
+### Deploy — the folder that matters
+
+| path | on the classpath? | evidence |
+|---|---|---|
+| `profiles\26\mods\` (top level) | **no** | jar placed there alone → `rat-cosmetics.txt` **never created**, entrypoint never ran |
+| `profiles\26\mods\fabric-26.3\` | **yes** | jar placed there → file created ≤3 s, `OK` in the log |
+
+Lunar downloads each mod to `mods\` at the path the mrpack declares, then **moves** it into
+`mods\fabric-26.3\` — which is where `fabric-api`, `iris`, `modmenu`, `placeholder-api` and
+`sodium` all live after a sync. Only that directory reaches the classpath. A stray copy at
+the top level is dead weight, and since two jars with the same `id` would be a duplicate-mod
+failure, it is left as `rat-cosmetics.jar.disabled` (`.disabled` is the loader's own
+recognition suffix).
+
+### Runtime behaviour
+
+A daemon thread named `rat-cosmetics` sleeps 3 s between injections, forever. The period is
+deliberate: the AssetServer reconnect loop retries every 30 s, and a successful reconnect
+could reset the equipped list, so re-injecting keeps overwriting it. The loop is idempotent
+for the same reason the handler is.
+
+Guarding it:
+
+```
+NOTREADY root=null                 <- thread woke before the client finished init
+NOTREADY mgr=false disp=false      <- root resolved, child services still coming up
+OK ids=[3, 2424, 894] uuid=9f8e7d6c-5b4a-4928-9706-f5e4d3c2b1a0
+```
+
+`NOTREADY` is timing, not failure — it is written once per distinct message and disappears
+as soon as the client is up. `OK` is written only after **both** calls return, and the log
+dedupes by message so it never spams.
+
+The UUID is read from `accounts.json` (`minecraftProfile.id`, dashed by regex) rather than
+hard-coded, so changing `$S2AccountId` does not break the mod. The protobuf builders are
+public API and called directly — only the obfuscated Lunar internals go through reflection,
+with `getMethod` first and a `getDeclaredMethod` + `setAccessible` walk up the superclass
+chain as fallback, since their access flags are not knowable without checking every build.
+
+### Configuration
+
+`%USERPROFILE%\.lunarclient\settings\game\rat-cosmetics.txt`, created on first run with the
+defaults — one integer `id` per line, `#` for comments. Change it and restart the game:
+
+```ini
+3        <- Lunar Client Classic (cloak)
+2424     <- Sun Glasses Black (glasses)
+894      <- Blue Tie (bodywear)
+```
+
+Log: `%USERPROFILE%\.lunarclient\settings\game\rat-cosmetics.log`.
+
+### Limits
+
+* **Other players' cosmetics do not render.** Their pushes never arrive, and there is no
+  offline source for their UUIDs plus equipped lists. Only the local account is injected.
+* **Cosmetic textures are not shipped locally.** 0 of the catalog's entries have their
+  `.webp` on disk. `jit_index` is an unauthenticated `path sha1 size timestamp` manifest and
+  the fetch goes to Lunar's CDN, not through the AssetServer — but it does require network,
+  and an id whose asset fails to download renders nothing.
+* **The `int` third argument to the manager handler is `0` by guess.** Nothing in the
+  bytecode names it. The dispatcher call is the load-bearing one; the manager call supplies
+  the colours, and `0` has produced correct logo/plus rendering in testing.
+* **Obfuscated names are build-specific.** A new `lunar.jar` needs the three getters and two
+  entry points re-mined — `sigs.py` plus a search for the `PlayerCosmeticsPushV2` descriptor
+  finds them in seconds.
+* Compiles against **JDK 25** (`javac 25.0.4.1`), class file version 69, which the bundled
+  Zulu JRE 25 reads natively.
