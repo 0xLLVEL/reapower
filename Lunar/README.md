@@ -40,6 +40,7 @@ disk outside the `mods` folder.
 9. [Stage 3 — cosmetics without the AssetServer](#9-stage-3--cosmetics-without-the-assetserver)
 10. [Stage 4 — branding, and the ad slot](#10-stage-4--branding-and-the-ad-slot)
 11. [Stage 5 — an in-launcher account entry point](#11-stage-5--an-in-launcher-account-entry-point)
+12. [Stages 6+7 — the four in-game account bugs](#12-stages-67--the-four-in-game-account-bugs)
 
 ---
 
@@ -74,6 +75,11 @@ revert-stage2.cmd    restore the pristine app.asar + accounts.json from backup
 
 account-manager.ps1  list / show / add / use / remove / refresh / validate the accounts
 mod\                 stage 3 source; build -> rat-cosmetics.jar (see §9)
+
+patch-ui.cmd         stage 4  - branding + ad slot; status then apply, app.asar
+patch-gameipc.cmd    stage 7  - GameIPC account routing; status then apply, app.asar
+patch-overlay.cmd    stage 6  - in-game overlay; status then apply, index.js
+patch-accounts.py    stage 5  - the Add Cracked Account row (python patch-accounts.py)
 ```
 
 Close the launcher first — the script refuses to touch a running instance.
@@ -82,7 +88,12 @@ Both stages are independent but stage 2 is useless without stage 1: with the fus
 any edit to `app.asar` aborts startup before a single line of `main.js` runs.
 
 `patch-stage2.cmd` must be re-run whenever `accessTokenExpiresAt` lapses — it is written as
-`now + 12h`, see [§8](#8-stage-2--the-minecraft-ownership-gate).
+`now + 13d`, see [§8](#8-stage-2--the-minecraft-ownership-gate).
+
+After an updater run, the order matters only in that both asar patchers must come back:
+`patch-ui.cmd` → `patch-accounts.py` → `patch-gameipc.cmd`. All three splice the same
+container and none of them reads another's anchors, so re-running any one of them on an
+already-patched asar is a no-op rather than a double patch.
 
 ---
 
@@ -1056,11 +1067,20 @@ window.lunar.auth.addAccount({ username })
   -> ipcRenderer.invoke("auth:addAccount", payload)
   -> the patched handler in ZAe.onSetup        (event, payload) -> (e, t)
   -> ZAe.addLocalAccount(t)
-  -> _Ee(profileId, name, accessToken, expiresAt, undefined, "Xbox", remoteId, localId)
+  -> _Ee(profileId, name, accessToken, expiresAt, refreshToken, "Xbox", remoteId, localId)
        writes accounts.json, sets activeAccountLocalId
   -> store.dispatch(KAe({uuid, username, localId, loading:false, invalid:false}))
        updates the in-memory profile list so the menu refreshes
 ```
+
+`refreshToken` was `undefined` here until stage 7, and it is a load-bearing field rather than
+a spare one: the game's `load()` adopts an account as current only when *both* `accessToken`
+and `refreshToken` are non-null. A record without one could be written, listed and switched
+to, and still never become the session. Stage 7 fills it with a fresh 86-character base64url
+token — the same shape the two working accounts already carry on disk.
+
+The GameIPC add in [§12](#12-stages-67--the-four-in-game-account-bugs) reaches this same
+method, so the one edit covers both entry points.
 
 `ipcMain.handle` passes the renderer's payload as the **second** argument and the
 `IpcMainInvokeEvent` as the first, which is why the signature becomes `(e,t)` and not
@@ -1072,8 +1092,10 @@ Three details in `addLocalAccount` are load-bearing:
 * **`profileId` is a v4 UUID.** The launch path normalises through `mN()`, which only
   rewrites a UUID that already passes the v4 test; a value it does not recognise leaves
   `getAccount()` missing and the launch dead with `SR.NO_ACCOUNT`.
-* **Expiry is `now + 12h`**, matching stage 2. A past date triggers the refresh path and
-  comes back `INVALID_SESSION`; anything past the 14-day window is rejected outright.
+* **Expiry is `now + 13d`** — `Date.now() + 11232e5`, matching stage 2. A past date triggers
+  the refresh path and comes back `INVALID_SESSION`; anything past the 14-day window is
+  rejected outright. The `12h` this README used to claim was the value before stage 5 moved
+  it, and `patch-lunar.ps1` already rewrites a token that falls outside the window.
 * **`Xbox` is a literal, not `gEe.Xbox`.** The enum sits thousands of bytes away in the
   bundle and its scope relative to this class is not knowable without running it, while
   the value is a plain string in the account record.
@@ -1095,17 +1117,24 @@ change. A re-render costs a re-injection rather than a broken tree.
 
 ### Verified, and not verified
 
-Verified before installation:
+Verified:
 
-* asar rebuilt to `c45d7f71`, `25,805,871` bytes, **1287 entries** (was 1286)
-* exactly **3 files differ**, and those are the three this patcher splices — nothing else
-  moved, which is what a lost byte would look like
-* all three JavaScript files pass `node --check` (`node v26.12.0`)
+* asar rebuilt with **exactly 1 file differing**, and it is the one being spliced — the
+  other 1286 read back byte-identical, which is what a lost byte would look like
+* the spliced `main.js` passes `node --check` (`node v26.12.0`)
+* the patch survives the updater's own run: `app.asar` still carries `rat-accounts` ×6 and
+  `Add Cracked Account` ×1 afterwards
 
-**Not verified: runtime.** The launcher has not been started against this asar. The
-splices are syntactically valid and the container is structurally sound, but whether
-`addLocalAccount` resolves every identifier it names — `R`, `Buffer`, `mN`, `_Ee`,
-`KAe`, `Z` — is only settled by opening the launcher.
+Proven end-to-end from the launcher and game logs, because these paths are shared with
+later stages:
+
+* `load()` adopting an account from disk — `Setting currentAccount to what was on disk: ezanism`
+* a completed switch — `Successfully switched to account ezanism`
+* `account-manager.ps1` — all 9 modes
+
+**Not verified: the renderer row itself.** Nothing in the logs records **Add Cracked
+Account** being clicked from the launcher menu. The handler, the bridge and the method are
+present and syntactically valid, but that click is still untested.
 
 ### Usage
 
@@ -1118,16 +1147,110 @@ Revert is the stage-4 backup path:
 |---|---|
 | `app.asar.stage4.pristine` | `4334600f`, before stage 4 |
 | `app.asar.stage4.applied` | `018f079d`, stage 4 in place, stage 5 absent |
+| `app.asar.s7.pristine` | `1fd16e60`, everything through stage 5, before stage 7 |
 
-Restoring either and re-running `patch-ui.cmd` / this patcher returns a known state.
+Restoring either and re-running `patch-ui.cmd` / this patcher returns a known state. Run
+`patch-gameipc.cmd` afterwards — the stage-7 splice lives in the same entry and would be
+gone.
 
 ### Limits
 
-* **Runtime is unconfirmed.** Treat the first launch as the test it is.
+* The renderer row is untested in the UI. Treat its first click as the test it is.
 * The menu item appears wherever the launcher renders the exact **Add Account** row. A
   build that rewords it moves the anchor and the item silently stops appearing.
-* **Switching** needs no new code — once an account is in the store the shipped
-  **Switch Account** submenu handles it. Only *adding* needed a path.
-* The updater replaces the asar. Re-run the patcher; the anchors should be re-confirmed
-  against a new `main.js`, since the handler text is minifier output and a different
-  bundler run will rename `t`, `e` and `x_`.
+* **Switching needed code after all**, just not in the add path: a stale `invalid` flag
+  rerouted the click to `addAccount()`, and GameIPC's `RefreshAccount` early-returned
+  without logging. Both are covered in [§12](#12-stages-67--the-four-in-game-account-bugs).
+* The updater replaces the asar. Re-run `patch-ui.cmd`, `patch-gameipc.cmd` and
+  `patch-accounts.py`, and re-confirm the anchors against a new `main.js` — the handler text
+  is minifier output, and a different bundler run will rename `t`, `e` and `x_`.
+
+---
+
+## 12. Stages 6+7 — the four in-game account bugs
+
+Stages 1–5 get the game to the main menu with an account on disk. Four things were still
+wrong from inside the game, and two of them could not be fixed from the overlay alone,
+because the record only the launcher can write sits one layer below it.
+
+| # | symptom | cause | fixed in |
+|---|---|---|---|
+| 1 | switching to an account does nothing | the row's `invalid` branch called `addAccount()` instead of `selectAccount()`; GameIPC `RefreshAccount` early-returned with no log | overlay + asar |
+| 2 | `⊕ Add` opens login.microsoftonline.com | `dLe.AddAccount()` called `auth.addAccount(game_add)` — the Microsoft device-code flow | asar |
+| 3 | `Invalid Session` toast pinned top right | game-originated popups reach the toast store through `sendNotification` unfiltered | overlay |
+| 4 | `Connecting...` on the account chip | the chip read `DISCONNECTED` as "connecting", and the asset client sits there permanently | overlay |
+
+### Why the overlay could not fix 1 and 2 alone
+
+`addAccount()` in the launcher's store *is* the Microsoft flow, and it is also the only thing
+reachable from the game that can write `accounts.json`. A local account has to be created
+somewhere with both tokens before any row can switch to it, so the fix belongs in the launcher
+process. The overlay could only decide which of the two gets called.
+
+`AddAccountRequest` is an empty protobuf — no username, no slot, nothing — so the name cannot
+arrive with the request and has to be minted in the handler: `Cracked` plus six base36
+characters. What the overlay does change is where the click lands.
+
+### The three rows that rerouted
+
+| site | where | change |
+|---|---|---|
+| `switcher-invalid-row` | account switcher overlay | `l()` → `C.onMouseDown` |
+| `chip-popover-invalid` | account chip popover | `addAccount()` → `selectAccount(r1)` |
+| `manager-popover-invalid` | manage accounts popover | `addAccount()` → `selectAccount(a)` |
+
+All three did it for the same reason: a profile with no `refreshToken` was flagged `invalid`,
+and `invalid` meant *go get a Microsoft token*. The account's own `accessToken` is what
+`selectAccount()` needs, and it was there the whole time.
+
+### The three asar edits
+
+| site | change |
+|---|---|
+| `add-account-local` | `e.addAccount(x_.game_add)` → `e.addLocalAccount({username: Cracked…})` |
+| `add-account-refresh` | `_Ee(…, void 0, …)` → `_Ee(…, <generated 86-char base64url>, …)` |
+| `refresh-entry-log` | log the uuid on arrival; compare normalised ids on both sides |
+
+The third is a diagnostic first and a fix second. `minecraftProfile.id` is dashed while the
+incoming uuid is normalised, so `!==` was always true and every refresh reported
+`game_switch` — which made a request that never arrived look identical to one that arrived
+and failed. The entry log separates them on the next run.
+
+### Container handling
+
+`patch-gameipc.py` carries its own reader rather than importing `asar-repack.py`. That tool
+rounds `data_start` up to a multiple of 4, and this header length is `347809` — not one. The
+rounding shifts every entry by three bytes, which reads `main.js` starting `nction(){try{var e=…`
+and fails `node --check` on a file that is valid. The correct value is derived from the header
+itself, `[4:8] + 8`, with no padding on write. `patch-accounts.py` documents the same finding
+independently.
+
+### Usage
+
+```
+patch-overlay.cmd     status; applies if any of the 5 overlay sites is missing
+patch-gameipc.cmd     status; applies if any of the 3 asar sites is missing
+```
+
+Both are idempotent — status reports `APPLIED` when the replacement is in place and the
+original anchor is gone, so a second run does nothing. Backups are `index.js.pristine` and
+`app.asar.s7.pristine`.
+
+### Verification
+
+* overlay: 5/5 `APPLIED`, `node --check` clean, `8,707,748` bytes, sha256 `87ce6b14bc024b3a`
+* asar: `node --check` clean, **1286 entries byte-identical, 0 diffs**; `main.js` 5,754,755 → 5,754,923 (`+168`); asar sha1 `1fd16e60` → `9a40f635`
+* stage-5 markers survive the repack: `rat-accounts` ×6, `Add Cracked Account` ×1, `refreshToken` ×7
+* `Lunar Client.exe` untouched at `7AA1BA60`
+
+**Not verified: runtime.** Neither patch has run against a live launcher and game.
+
+### Limits
+
+* Bug 3's toast and bug 4's label are display-level. The `joinServer` 401 underneath both is
+  Mojang's, answered server-side, and no local patch reaches it — the labels go quiet, the
+  reconnect loop does not stop.
+* The generated `Cracked…` name is permanent for that record. There is no rename path; the
+  account is deleted and re-added instead.
+* `mc-create-session` still fails every ~30s (`Code: 1000 — Failed encryption`) and is
+  unrelated to anything here.
