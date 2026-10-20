@@ -51,19 +51,23 @@ function ensureStyle() {
   document.head.appendChild(styleEl);
 }
 
-// The launcher renders each menu row as an element whose full text is the i18n string.
-// Matching on exact text avoids catching "Add Account (via Link)" or a nested span.
+// The launcher renders each row as a container holding an icon and a label, so the
+// exact-text match hits both the row and its inner label span. Taking the outermost
+// match is what makes the new item land as a sibling of the row instead of inside its
+// own label. Rows are only visible while the menu is open, which is why the caller
+// re-runs this on every mutation.
 function findRow(text) {
-  const rows = document.querySelectorAll(`div,button,span,li,a`);
-  for (const el of rows) {
+  const all = [];
+  for (const el of document.querySelectorAll("div,button,span,li,a")) {
     if (el.getAttribute(MARK)) continue;
-    if (el.childElementCount > 2) continue;
-    if ((el.textContent || "").trim() !== text) continue;
+    const t = (el.textContent || "").trim();
+    if (t !== text && t !== LINK) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 40 || r.height < 10) continue;
-    return el;
+    all.push(el);
   }
-  return null;
+  const outer = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
+  return outer.find((el) => (el.textContent || "").trim() === text) || null;
 }
 
 function buildPanel() {

@@ -136,9 +136,12 @@ METHOD_BODY = (
 PRELOAD_FIND = "_={async addAccount(){return await u.ipcRenderer.invoke(`auth:addAccount`)}"
 PRELOAD_REPL = "_={async addAccount(e){return await u.ipcRenderer.invoke(`auth:addAccount`,e)}"
 
+# Relative, matching how the bundle references its own entry - the other tags are
+# "../assets/main.js", not "/dist/assets/main.js". An absolute src on a file:// origin
+# resolves against the filesystem root and 404s, so the module never runs at all.
 HTML_FIND = "</body>"
 HTML_REPL = (
-    '<script type="module" crossorigin src="/dist/assets/rat-accounts.js"></script>'
+    '<script type="module" crossorigin src="../assets/rat-accounts.js"></script>'
     "</body>"
 )
 
