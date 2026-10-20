@@ -66,6 +66,14 @@ function ensureStyle() {
 // Collects every element whose visible text is exactly the target, then keeps the
 // outermost. The launcher's row holds an icon and a label, so an innermost-first search
 // would match the label span and insert the new item inside its own label.
+//
+// The outermost is the candidate that no OTHER candidate contains - `o.contains(el)`, not
+// `el.contains(o)`. Reading it the other way round filters out exactly the element being
+// looked for: the row contains the label, so the row is discarded and only the label
+// survives, and the new item lands one level too deep to render as a menu entry.
+let searchedText = 0;
+let searchedOuter = 0;
+
 function findRow(text) {
   const all = [];
   for (const el of document.querySelectorAll("div,button,span,li,a")) {
@@ -75,7 +83,9 @@ function findRow(text) {
     if (r.width < 40 || r.height < 10) continue;
     all.push(el);
   }
-  const outer = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
+  const outer = all.filter((el) => !all.some((o) => o !== el && o.contains(el)));
+  searchedText = all.length;
+  searchedOuter = outer.length;
   return outer[0] || null;
 }
 
@@ -162,9 +172,26 @@ function buildPanel() {
 let injected = false;
 
 function inject() {
-  if (injected) return true;
+  // React replaces menu nodes on every state change, so an item that was inserted once
+  // is gone the next time the dropdown opens. A sticky `injected` flag would leave the
+  // menu permanently empty after the first re-render, which is why the flag is derived
+  // from whether the node is still in the document rather than remembered.
+  const existing = document.querySelector("." + MARK + "-item");
+  if (existing && document.documentElement.contains(existing)) return true;
+  injected = false;
+
   const anchor = findRow(EXISTING);
-  if (!anchor) return false;
+  const chip = document.querySelector("." + MARK + "-chip");
+  if (!anchor) {
+    // The console is not reachable from here, so the chip's tooltip carries the counts.
+    // "0 matched" and "3 matched, 1 outermost" are different failures and it is the only
+    // thing that separates a text mismatch from a tree-shape problem.
+    if (chip)
+      chip.title =
+        'no "Add Account" row yet - text matches ' + searchedText + ", outermost " + searchedOuter;
+    return false;
+  }
+  if (chip) chip.title = "Add a local Minecraft account";
 
   const item = document.createElement("div");
   item.className = MARK + "-item";
@@ -178,7 +205,6 @@ function inject() {
 
   anchor.insertAdjacentElement("afterend", item);
   injected = true;
-  const chip = document.querySelector("." + MARK + "-chip");
   if (chip) chip.setAttribute("data-injected", "1");
   console.log(LOG, "menu item injected");
   return true;

@@ -56,10 +56,13 @@ def read_container(path):
         head = f.read(16)
         if struct.unpack("<I", head[0:4])[0] != 4:
             raise SystemExit("not an asar")
+        block = struct.unpack("<I", head[4:8])[0]
         json_len = struct.unpack("<I", head[12:16])[0]
         tree = json.loads(f.read(json_len).decode("utf-8"))
-        data_start = 16 + json_len
-        data_start += (-data_start) % 4
+        # block + 8 is where the data section begins - derived, not guessed. Rounding up
+        # to an alignment would read every file from the wrong offset whenever the
+        # header length is not a multiple of 4.
+        data_start = block + 8
     return tree, data_start
 
 
@@ -241,13 +244,18 @@ def main():
 
     emit(tree)
 
+    # No padding, ever. [4:8] is the size of the block from byte 8, so data_start is
+    # [4:8] + 8 and the header runs right up to it. Trailing NULs after the JSON would
+    # be inside the length the reader hands to the parser, and both Python's json and
+    # Electron's JSON.parse reject extra data - a header that parses in one reader and
+    # not the other is a launcher that will not start. The original container reports an
+    # offset alignment of 1, so there is nothing to align to anyway.
     header = json.dumps(tree, separators=(",", ":")).encode("utf-8")
-    header += b"\0" * ((-(16 + len(header))) % 4)
 
     body = bytearray()
     body += struct.pack("<I", 4)
-    body += struct.pack("<I", 4 + 4 + len(header))
-    body += struct.pack("<I", len(header) + 4)
+    body += struct.pack("<I", 8 + len(header))
+    body += struct.pack("<I", 4 + len(header))
     body += struct.pack("<I", len(header))
     body += header
     body += data

@@ -27,10 +27,12 @@ def main():
     raw = open(p, "rb").read()
 
     u32 = [struct.unpack("<I", raw[i : i + 4])[0] for i in range(0, 16, 4)]
-    jl = u32[12 // 4]
+    jl = u32[3]
     tree = json.loads(raw[16 : 16 + jl].decode("utf-8"))
-    ds = 16 + jl
-    ds += (-ds) % 4
+    # data_start comes from the block size, not from guessing an alignment: the header
+    # runs byte-aligned to the data section, and the original container reports offsets
+    # aligned to 1, so rounding up here would silently read the wrong bytes.
+    ds = u32[1] + 8
 
     print("file   : %s" % p)
     print("size   : %d" % len(raw))
