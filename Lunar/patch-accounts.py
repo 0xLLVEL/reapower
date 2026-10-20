@@ -152,6 +152,9 @@ METHOD_BODY = (
     "async addAccount(e){"
 )
 
+ACCOUNT_ID_FIND = ".find(t=>t.minecraftProfile.id===mN(e))"
+ACCOUNT_ID_REPL = ".find(t=>mN(t.minecraftProfile.id)===mN(e))"
+
 PRELOAD_FIND = "_={async addAccount(){return await u.ipcRenderer.invoke(`auth:addAccount`)}"
 PRELOAD_REPL = "_={async addAccount(e){return await u.ipcRenderer.invoke(`auth:addAccount`,e)}"
 
@@ -190,6 +193,28 @@ def main():
         raise SystemExit("main.method: anchor not unique")
     print("  %-22s +%d B  %s" % ("main.method", len(METHOD_BODY) - len(METHOD_ANCHOR), "addLocalAccount inserted"))
     mainjs = mainjs.replace(METHOD_ANCHOR, METHOD_BODY, 1)
+
+    # Normalise BOTH sides of every account lookup, in all four of them.
+    #
+    # `fN` accepts a v4 uuid in either form - dashed or undashed - and `mN` maps both to
+    # undashed. The lookups compared a stored id against `mN(input)`, so a dashed id on
+    # disk never equalled the undashed form it was matched against and every one of them
+    # missed. `getAccount` is what the switch path calls, which is where this surfaced as
+    # SR.NO_ACCOUNT; the other three were broken the same way and had simply not been
+    # exercised. Removal in particular fails silently - `kR` logs "No account found ...
+    # skipping removal" and returns, leaving the account in the file.
+    #
+    # Storing the id undashed instead would also have matched, but a dashed profileId is
+    # what has already been proven to launch and to resolve cosmetics, so the data shape
+    # stays and the comparison is what gets fixed.
+    n_id = mainjs.count(ACCOUNT_ID_FIND)
+    if n_id != 4:
+        raise SystemExit("accounts.id: %d occurrence(s), expected 4" % n_id)
+    print(
+        "  %-22s +%d B  %d sites, both sides normalised"
+        % ("accounts.id", len(ACCOUNT_ID_REPL) - len(ACCOUNT_ID_FIND), n_id)
+    )
+    mainjs = mainjs.replace(ACCOUNT_ID_FIND, ACCOUNT_ID_REPL)
 
     preload = read_entry("/dist-electron/preload/launcher/index.js").decode("utf-8")
     preload = splice(preload, PRELOAD_FIND, PRELOAD_REPL, "preload.auth")
