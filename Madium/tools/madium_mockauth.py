@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Madium local auth server - shape-corrected build.
+
+Response shape was recovered from Madium.exe bytecode, not guessed:
+
+  0x1402228bd  map_get("error")        -> key MUST exist
+  0x1402228d3  byte[0] == 1            -> must be a bool (serde_json tag 1)
+  0x1402228d8  byte[1] == 0            -> must be false, else "Sign-in failed"
+  0x140222969  map_get("message")      -> session object lives HERE
+  0x14022298a  byte[0] == 5            -> message must be an object (serde_json tag 5)
+  0x1402229ce  map_get("alg")          -> read from message, must equal "Ed25519"
+  0x14021fbf6  map_get("signature")    -> read from message
+  0x140222de2  map_get("hwid")         -> read from message
+  0x140222e46  map_get("issuedAt")     -> read from message
+  0x140222f01  map_get("expiresAt")    -> read from message
+  0x140222f2f  map_get("token")        -> read from message
+
+So /account/auth answers:
+    {"error": false, "message": { ...session... }}
+
+and /keys/auth/secure answers the flat verdict the real server returns:
+    {"status","nonce","hwid","timestamp","issuedAt","expiresAt","reason","alg","signature"}
+
+The signature covers the canonical JSON of the signed object with "alg" and "signature"
+removed, keys sorted, compact separators. That rule was cracked and verified against a
+real server-signed verdict.
+
+Success signal: after a good sign-in the client posts /keys/auth/secure, which this
+server announces.
+
+Usage
+-----
+    python madium_mockauth.py --port 8080 --key-pair keypair.json
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+except ImportError:
+    sys.exit("cryptography is required: pip install cryptography")
+
+UNSIGNED_FIELDS = ("alg", "signature")
+
+
+def canonical_message(payload: dict) -> bytes:
+    signed = {k: v for k, v in payload.items() if k not in UNSIGNED_FIELDS}
+    return json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sign(private_key: Ed25519PrivateKey, payload: dict) -> dict:
+    out = dict(payload)
+    out["alg"] = "Ed25519"
+    out["signature"] = base64.b64encode(
+        private_key.sign(canonical_message(out))
+    ).decode("ascii")
+    return out
+
+
+def load_or_create_keypair(path: str) -> Ed25519PrivateKey:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            material = json.load(handle)
+        return Ed25519PrivateKey.from_private_bytes(base64.b64decode(material["private"]))
+    private = Ed25519PrivateKey.generate()
+    raw = private.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"private": base64.b64encode(raw).decode("ascii")}, handle, indent=2)
+    return private
+
+
+def public_hex(private: Ed25519PrivateKey) -> str:
+    raw = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+    )
+    return raw.hex()
+
+
+def iso_now() -> str:
+    moment = datetime.now(timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (moment.microsecond // 1000)
+
+
+class MockAuth(BaseHTTPRequestHandler):
+    server_version = "MadiumMockAuth/1.2"
+    protocol_version = "HTTP/1.1"
+
+    private_key = None
+    expires_days = 3650
+    deny = False
+    verbose = True
+
+    def log_message(self, fmt, *args):
+        if self.verbose:
+            sys.stderr.write("[mock] " + (fmt % args) + "\n")
+
+    def _json(self, status: int, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            pass
+        try:
+            return dict(parse_qsl(raw.decode("utf-8")))
+        except Exception:
+            return {}
+
+    def do_POST(self):
+        route = self.path.split("?")[0].rstrip("/")
+        if route.endswith("/account/auth"):
+            self._account_auth()
+        elif route.endswith("/keys/auth/secure"):
+            self._keys_auth_secure()
+        else:
+            self._catch_all()
+
+    def do_GET(self):
+        self._json(200, {"status": "ok", "service": "madium-mock-auth"})
+
+    def _session(self, request: dict, token: str) -> dict:
+        now_ms = int(time.time() * 1000)
+        expires_ms = now_ms + int(self.expires_days * 24 * 3600 * 1000)
+        session = {
+            "alg": "Ed25519",
+            "signature": "",
+            "hwid": str(request.get("hwid", "")),
+            "nonce": str(request.get("nonce", "")),
+            "issuedAt": now_ms,
+            "expiresAt": expires_ms,
+            "timestamp": iso_now(),
+            "status": "LICENSE_VALID",
+            "reason": "",
+            "token": token,
+            "key": token,
+        }
+        return sign(self.private_key, session)
+
+    def _account_auth(self):
+        request = self._read_json()
+        username = str(request.get("login", request.get("username", "")))
+        password = str(request.get("password", ""))
+        if self.deny:
+            self.log_message("sign-in %s denied (forced)", username)
+            self._json(200, {"error": True, "message": "You have no time left. Top up on the site."})
+            return
+        if not password:
+            self._json(200, {"error": True, "message": "Username and password are required"})
+            return
+
+        token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        session = self._session(request, token)
+        body = {"error": False, "message": session}
+        self.log_message("sign-in %s accepted", username)
+        self.log_message("  root keys: %s", sorted(body.keys()))
+        self.log_message("  message keys: %s", sorted(session.keys()))
+        self._json(200, body)
+
+    def _keys_auth_secure(self):
+        request = self._read_json()
+        if not self.headers.get("Authorization"):
+            self._json(400, {"error": True, "message": "Authorization header is required"})
+            return
+        self.log_message("SUCCESS SIGNAL: client requested /keys/auth/secure")
+        token = self.headers.get("Authorization", "")
+        verdict = self._session(request, token)
+        self._json(200, verdict)
+
+    def _catch_all(self):
+        request = self._read_json()
+        token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        self.log_message("catch-all for %s", self.path)
+        self._json(200, {"error": False, "message": self._session(request, token)})
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Madium local auth server")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--key-pair", default="keypair.json")
+    parser.add_argument("--expires-days", type=int, default=3650)
+    parser.add_argument("--deny", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--generate-key-only", action="store_true",
+                        help="create the keypair if needed, print the public key and exit")
+    args = parser.parse_args()
+
+    private = load_or_create_keypair(args.key_pair)
+    MockAuth.private_key = private
+    MockAuth.expires_days = args.expires_days
+    MockAuth.deny = args.deny
+    MockAuth.verbose = not args.quiet
+
+    pub = public_hex(private)
+
+    if args.generate_key_only:
+        print(pub)
+        return 0
+
+    print("=" * 76)
+    print("Madium local auth server  (shape-corrected)")
+    print("=" * 76)
+    print("listening        http://{}:{}".format(args.host, args.port))
+    print("key pair file    {}".format(os.path.abspath(args.key_pair)))
+    print()
+    print("Ed25519 public key (32 bytes hex):")
+    print("    {}".format(pub))
+    print()
+    print("success signal   a POST to /keys/auth/secure")
+    print("=" * 76)
+    print()
+
+    server = ThreadingHTTPServer((args.host, args.port), MockAuth)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

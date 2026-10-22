@@ -14,6 +14,10 @@ _teststate/
 work/
 sim/
 
+# Madium: the local Ed25519 keypair never leaves the machine
+Madium/state/
+*.pub
+
 # logs / captures
 *.log
 *.png
