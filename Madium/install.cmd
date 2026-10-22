@@ -12,4 +12,6 @@ if %errorlevel% neq 0 (
 echo === Install Madium Entitlement Patch ===
 powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%Install-MadiumPatch.ps1"
 echo.
+echo [i] later, to bring the endpoint back up without patching again: start.cmd
+echo.
 pause

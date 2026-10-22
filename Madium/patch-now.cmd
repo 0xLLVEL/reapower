@@ -11,10 +11,11 @@ if %errorlevel% neq 0 (
 
 echo === Madium manual patch (no watcher, no task) ===
 
+set "STATE=%LOCALAPPDATA%\MadiumUnlock\state"
 set "PUB="
-if exist "%~dp0state\keypair.pub" set /p PUB=<"%~dp0state\keypair.pub"
+if exist "%STATE%\keypair.pub" set /p PUB=<"%STATE%\keypair.pub"
 if "%PUB%"=="" (
-    echo [x] no keypair found in state\keypair.pub - run install.cmd first
+    echo [x] no keypair found in %STATE%\keypair.pub - run install.cmd first
     echo.
     pause
     exit /b 1

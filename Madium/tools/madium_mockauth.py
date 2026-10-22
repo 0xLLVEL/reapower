@@ -39,6 +39,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +52,10 @@ except ImportError:
     sys.exit("cryptography is required: pip install cryptography")
 
 UNSIGNED_FIELDS = ("alg", "signature")
+
+# Life-cycle state. The client asks for the verdict once per launch and then goes
+# quiet, so the endpoint can retire itself once it is no longer needed.
+STATE = {"last_request": 0.0, "verdict_served": False}
 
 
 def canonical_message(payload: dict) -> bytes:
@@ -120,6 +125,10 @@ class MockAuth(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_one_request(self):
+        STATE["last_request"] = time.time()
+        BaseHTTPRequestHandler.handle_one_request(self)
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -193,6 +202,7 @@ class MockAuth(BaseHTTPRequestHandler):
         self.log_message("SUCCESS SIGNAL: client requested /keys/auth/secure")
         token = self.headers.get("Authorization", "")
         verdict = self._session(request, token)
+        STATE["verdict_served"] = True
         self._json(200, verdict)
 
     def _catch_all(self):
@@ -237,6 +247,28 @@ def daemonize(args):
     return 0
 
 
+def watchdog(server, idle_timeout: int, exit_after_verdict: bool, stop_event: threading.Event):
+    """Retire the endpoint once nobody needs it any more.
+
+    The client asks for its verdict once per launch and then goes quiet, so an
+    endpoint that has served the verdict and then sees no traffic for a while is
+    no longer part of the running system. An idle timeout does the same without
+    waiting for the verdict.
+    """
+    if idle_timeout <= 0:
+        return
+    while not stop_event.wait(0.5):
+        if exit_after_verdict and not STATE["verdict_served"]:
+            continue
+        idle = time.time() - STATE["last_request"]
+        if idle >= idle_timeout:
+            reason = "the verdict was served" if exit_after_verdict else "no traffic"
+            MockAuth.log_message("idle for %.0fs (%s) - the endpoint is no longer needed, exiting",
+                                 idle, reason)
+            server.shutdown()
+            return
+
+
 def main():
     parser = argparse.ArgumentParser(description="Madium local auth server")
     parser.add_argument("--port", type=int, default=8080)
@@ -251,6 +283,10 @@ def main():
                         help="write the server pid to this file once it is listening")
     parser.add_argument("--daemon", action="store_true",
                         help="start a detached background copy and return immediately")
+    parser.add_argument("--idle-timeout", type=int, default=0,
+                        help="exit after this many seconds without a request (0 = never)")
+    parser.add_argument("--exit-after-verdict", action="store_true",
+                        help="exit once the verdict was served and the client went quiet")
     parser.add_argument("--generate-key-only", action="store_true",
                         help="create the keypair if needed, print the public key and exit")
     args = parser.parse_args()
@@ -300,13 +336,36 @@ def main():
         MockAuth.log_message("key pair file %s", os.path.abspath(args.key_pair))
 
     server = ThreadingHTTPServer((args.host, args.port), MockAuth)
+    STATE["last_request"] = time.time()
     if args.pid_file:
         with open(args.pid_file, "w", encoding="ascii") as handle:
             handle.write(str(os.getpid()))
+
+    idle_timeout = args.idle_timeout
+    if args.exit_after_verdict and idle_timeout <= 0:
+        idle_timeout = 20
+    stop_event = threading.Event()
+    watcher = None
+    if idle_timeout > 0:
+        watcher = threading.Thread(
+            target=watchdog,
+            args=(server, idle_timeout, args.exit_after_verdict, stop_event),
+            daemon=True)
+        watcher.start()
+        MockAuth.log_message("life cycle: idle timeout %ds%s", idle_timeout,
+                             (", exit after the verdict is served" if args.exit_after_verdict else ""))
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nstopped")
+        pass
+    finally:
+        stop_event.set()
+        if args.pid_file:
+            try:
+                os.remove(args.pid_file)
+            except OSError:
+                pass
     return 0
 
 

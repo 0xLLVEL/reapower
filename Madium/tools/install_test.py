@@ -202,6 +202,39 @@ def main():
     except Exception:
         foreign.kill()
 
+    print("\n=== H. the endpoint retires itself once the client has its verdict ===")
+    life_port = PORT + 20
+    life_state = os.path.join(scratch, "lifestate")
+    shutil.rmtree(life_state, ignore_errors=True)
+    life = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", INSTALLER, "-Target", target, "-Port", str(life_port),
+         "-StateDir", life_state, "-ExitAfterVerdict", "-IdleTimeout", "5"],
+        capture_output=True, text=True, timeout=180)
+    check("life cycle install exits 0", life.returncode == 0, "exit={}".format(life.returncode))
+    check("endpoint is up before the verdict", endpoint_alive(life_port),
+          "port {}".format(life_port))
+    body = json.dumps({"login": "u", "password": "p", "hwid": "h", "nonce": "n"}).encode()
+    request = urllib.request.Request("http://127.0.0.1:{}/account/auth".format(life_port),
+                                     data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=6) as response:
+        session = json.loads(response.read().decode())
+    token = session["message"]["token"]
+    verdict = urllib.request.Request(
+        "http://127.0.0.1:{}/keys/auth/secure".format(life_port),
+        data=body, headers={"Content-Type": "application/json",
+                            "Authorization": "Bearer {}".format(token)})
+    with urllib.request.urlopen(verdict, timeout=6) as response:
+        response.read()
+    check("verdict was served", True)
+    # No polling here: every request would reset the endpoint's idle timer and
+    # keep it alive. Just wait, then look once.
+    time.sleep(12)
+    retired = not endpoint_alive(life_port, 2)
+    check("the endpoint exited on its own", retired, "port {}".format(life_port))
+    check("the pid file was cleaned up",
+          not os.path.exists(os.path.join(life_state, "mockauth.pid")))
+
     shutil.rmtree(scratch, ignore_errors=True)
 
     print("\n" + "=" * 68)

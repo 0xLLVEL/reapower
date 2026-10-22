@@ -24,6 +24,10 @@ param(
     [string]$StateDir,
     [switch]$Uninstall,
     [switch]$DryRun,
+    [switch]$StartEndpointOnly,
+    [switch]$KeepEndpoint,
+    [switch]$ExitAfterVerdict,
+    [int]$IdleTimeout = 20,
     [int]$Port = 8080,
     [switch]$Quiet
 )
@@ -35,7 +39,7 @@ $Tools = Join-Path $Here 'tools'
 $DefaultTarget = Join-Path $env:LOCALAPPDATA 'Madium\Bin\Madium.exe'
 if (-not $Target) { $Target = $DefaultTarget }
 
-if (-not $StateDir) { $StateDir = Join-Path $Here 'state' }
+if (-not $StateDir) { $StateDir = Join-Path $env:LOCALAPPDATA 'MadiumUnlock\state' }
 $KeyPair = Join-Path $StateDir 'keypair.json'
 $KeyPairPub = Join-Path $StateDir 'keypair.pub'
 $MockScript = Join-Path $Tools 'madium_mockauth.py'
@@ -111,7 +115,7 @@ if ($Uninstall) {
 
 # ---------------------------------------------------------------- install
 
-if (-not (Test-Path -LiteralPath $Target)) {
+if (-not $StartEndpointOnly -and -not (Test-Path -LiteralPath $Target)) {
     Write-Log "target not found: $Target" 'bad'
     exit 2
 }
@@ -125,6 +129,12 @@ if (-not $python) {
 if (-not (Test-Path -LiteralPath $StateDir)) {
     New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 }
+
+# The endpoint script is copied into the state directory so the machine keeps
+# everything it needs there - the checkout can be moved or deleted without
+# breaking the client, and start.cmd still finds the server.
+$MockCopy = Join-Path $StateDir 'madium_mockauth.py'
+Copy-Item -LiteralPath $MockScript -Destination $MockCopy -Force
 
 # 1. keypair - generate once, reuse afterwards. Both halves have to be present:
 # keeping a public key whose private half was deleted leaves the endpoint unable
@@ -155,6 +165,7 @@ if ($keyPairIntact) {
 }
 
 # 2. patch
+if (-not $StartEndpointOnly) {
 $patchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Here 'MadiumPatch.ps1'),
     '-Target', $Target, '-Profile', 'full', '-Port', $Port, '-Redirect', "127.0.0.1:$Port", '-PubKey', $pubHex)
 if ($DryRun) { $patchArgs += '-DryRun' }
@@ -212,6 +223,7 @@ if ($pubkeyLine.Count -ne 1) {
     exit 5
 }
 Write-Log "verified on disk: $($patchedByteSites.Count) byte sites, auth host redirected, pinned key in place" 'good'
+}
 
 # 3. start the local auth endpoint
 # stop a previous instance of *this* install first
@@ -221,7 +233,18 @@ Write-Log "starting the local auth endpoint on 127.0.0.1:$Port"
 # The server detaches itself: it is spawned with its own handles so it never keeps
 # the caller's stdout pipe open, which would otherwise make the caller wait for
 # the whole lifetime of the server.
-& $python $MockScript --port $Port --key-pair $KeyPair --quiet --log $LogFile --daemon --pid-file $PidFile
+$endpointArgs = @('--port', $Port, '--key-pair', $KeyPair, '--quiet', '--log', $LogFile,
+    '--daemon', '--pid-file', $PidFile)
+# The client asks for its verdict once per launch and then goes quiet, so the
+# endpoint retires itself afterwards. -KeepEndpoint turns that off.
+$retire = ($ExitAfterVerdict -or (-not $KeepEndpoint))
+if ($retire) {
+    $endpointArgs += '--exit-after-verdict'
+    $endpointArgs += @('--idle-timeout', $(if ($IdleTimeout -gt 0) { $IdleTimeout } else { 20 }))
+} elseif ($IdleTimeout -gt 0) {
+    $endpointArgs += @('--idle-timeout', $IdleTimeout)
+}
+& $python $MockCopy @endpointArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Log "the local auth endpoint failed to start" 'bad'
     exit 5
@@ -254,9 +277,34 @@ if (-not $alive) {
     exit 5
 }
 
+# The process that answers on the port has to be the one we started. Windows lets a
+# second socket bind a port that is already taken, so a leftover endpoint from an
+# older install would answer the probe and the install would look successful while
+# the new endpoint never got the traffic.
+$listenerPid = $null
+for ($i = 0; $i -lt 20; $i++) {
+    $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($conn) { $listenerPid = $conn.OwningProcess; break }
+    Start-Sleep -Milliseconds 250
+}
+if ($listenerPid -and $listenerPid -ne $endpointPid) {
+    Write-Log "port $Port is already in use by pid $listenerPid - the new endpoint did not take it" 'bad'
+    Write-Log "stop that process, or use a different -Port" 'warn'
+    Stop-Process -Id $endpointPid -Force -ErrorAction SilentlyContinue
+    exit 5
+}
+
 Write-Log "local auth endpoint running, pid $endpointPid" 'good'
 Write-Log "logs: $LogFile"
+if ($retire) {
+    Write-Log "the endpoint retires itself once the client has its verdict (after $IdleTimeout s of silence)" 'good'
+}
 Write-Log ''
 Write-Log 'Open Madium and sign in with any credentials.' 'good'
-Write-Log 'The endpoint must stay running while the client is open.'
+if ($retire) {
+    Write-Log 'The endpoint exits on its own after the verdict - run start.cmd to bring it back.'
+} else {
+    Write-Log 'The endpoint must stay running while the client is open.'
+}
 exit 0

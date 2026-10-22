@@ -57,6 +57,7 @@ not seen; see [8. Limits](#8-limits).
 
 ```
 install.cmd          (backs up Madium.exe, patches, generates a keypair, starts the endpoint)
+start.cmd            (brings the endpoint back up - no patch, no UAC)
 patch-now.cmd        (re-patch after an Madium update - manual mode, no task, no watcher)
 uninstall.cmd        (restores the pristine Madium.exe, stops the endpoint, removes the keypair)
 ```
@@ -66,8 +67,39 @@ uninstall.cmd        (restores the pristine Madium.exe, stops the endpoint, remo
 Requires Python 3 with `cryptography` installed (`pip install cryptography`) - the local
 endpoint signs with Ed25519.
 
-After install, open Madium and sign in with **any** credentials. The endpoint must stay
-running while the client is open.
+After install, open Madium and sign in with **any** credentials. The endpoint must be up
+when the client starts.
+
+The keypair and the endpoint state live in `%LOCALAPPDATA%\MadiumUnlock\state`, not next to
+this folder - the checkout can be moved or deleted without breaking the client, and
+`start.cmd` always finds the same keypair the binary was patched with.
+
+### The endpoint's life cycle
+
+The client asks for its verdict **once per launch** - one `POST /keys/auth/secure` - and
+then goes quiet. Measured from the endpoint's own log, nothing else follows:
+
+```
+[mock] SUCCESS SIGNAL: client requested /keys/auth/secure
+[mock] "POST /keys/auth/secure HTTP/1.1" 200 -
+```
+
+The verdict is not cached anywhere on disk (the session token is, in `key.bin`; the verdict
+is not), so the endpoint is needed at every launch but not for the rest of the session.
+That is why the endpoint retires itself:
+
+- it exits **20 seconds after the verdict** was served, by default;
+- the log says why, and the pid file is removed on the way out;
+- `start.cmd` brings it back for the next launch - no patch, no UAC.
+
+```
+[mock] life cycle: idle timeout 20s, exit after the verdict is served
+[mock] SUCCESS SIGNAL: client requested /keys/auth/secure
+[mock] idle for 20s (the verdict was served) - the endpoint is no longer needed, exiting
+```
+
+`install.cmd -KeepEndpoint` keeps it running forever instead, and `-IdleTimeout <seconds>`
+sets the grace period.
 
 ### What the installer does, in order
 
@@ -85,6 +117,10 @@ running while the client is open.
 5. keeps a backup that holds the *pristine* bytes. Re-patching an already-patched binary
    would otherwise leave a "backup" that is the patched file, which makes restore useless -
    a backup whose hash is not the pristine one is moved aside to `.bak.stale`.
+
+The endpoint is started with `--exit-after-verdict`, so it retires itself once the client
+has its verdict. `-KeepEndpoint` turns that off, `-IdleTimeout <seconds>` sets the grace
+period, and `start.cmd` starts the endpoint alone.
 
 ### Running the patcher by hand
 
@@ -119,6 +155,11 @@ the pid file. Without it the server inherits the caller's stdout, and a caller t
 captures that output waits for the pipe to close - which means waiting for the whole
 lifetime of the server.
 
+`--exit-after-verdict` retires the server once it has served the verdict and the client
+has gone quiet for `--idle-timeout` seconds (default 20). `--idle-timeout <seconds>` on
+its own exits after that many seconds without any request. The server removes its pid file
+on the way out.
+
 ---
 
 ## 3. What it does / what it does NOT do
@@ -147,7 +188,8 @@ lifetime of the server.
 - **Modify the WebView2 frontend.** The gate is enforced in Rust; the `LicenseStatus` struct
   (`expires_at`, `has_token`) that the frontend renders is produced by the patched code.
 - **Run in the background.** No service, no scheduled task, no injector, no driver. The
-  endpoint is a plain `python` process you can see and kill.
+  endpoint is a plain `python` process you can see and kill - and it kills itself once the
+  client has its verdict.
 
 ---
 
@@ -458,8 +500,10 @@ ALL CHECKS PASSED
   every byte site is in a state it recognises - pristine or already patched - in which case
   the build is accepted and the patch is applied to what is missing. There is no matcher
   here - the sites are byte-exact, so a re-analysis is needed after an update.
-- **The endpoint must be running.** The client is pointed at `127.0.0.1:8080`. Kill the
-  process and the client cannot authenticate.
+- **The endpoint must be running when the client starts.** The client is pointed at
+  `127.0.0.1:8080` and asks for its verdict once per launch. After that it does not need
+  the endpoint, and the endpoint retires itself - `start.cmd` brings it back for the next
+  launch. Kill the process too early and the client has no verdict to work with.
 - **The patched binary only trusts this endpoint.** Because patch 7 replaces the pinned key,
   a verdict signed by the real vendor is rejected by the patched client. Restore with
   `uninstall.cmd` before contacting the real service.
