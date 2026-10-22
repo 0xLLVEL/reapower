@@ -69,6 +69,36 @@ endpoint signs with Ed25519.
 After install, open Madium and sign in with **any** credentials. The endpoint must stay
 running while the client is open.
 
+### Running the patcher by hand
+
+**PowerShell swallows arguments that start with `--`, so use a single dash.** This is a
+PowerShell quirk, not a patcher bug - `--in-place` never reaches the process, so the patch
+lands in a side file instead of the target. Every option accepts `-name`, `--name` and the
+bare `name`.
+
+```powershell
+# 1. generate the keypair and print the public key
+python tools\madium_mockauth.py --port 8080 --key-pair keypair.json --generate-key-only
+
+# 2. patch the client (copy the public key from step 1)
+.\tools\madium_unlock.exe "$env:LOCALAPPDATA\Madium\Bin\Madium.exe" `
+  -in-place -profile full -redirect 127.0.0.1:8080 -pubkey <PUBLICKEY>
+
+# 3. start the endpoint
+python tools\madium_mockauth.py --port 8080 --key-pair keypair.json
+```
+
+From `cmd.exe` the double-dash form works as documented:
+
+```
+madium_unlock.exe "%LOCALAPPDATA%\Madium\Bin\Madium.exe" ^
+  --in-place --profile full --redirect 127.0.0.1:8080 --pubkey <PUBLICKEY>
+```
+
+`-list` and `-verify` only read the file and always exit 0, even for a binary that is
+already patched. Re-patching an already-patched binary is allowed: the per-site byte
+assertions decide, not the hash.
+
 ---
 
 ## 3. What it does / what it does NOT do

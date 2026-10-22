@@ -79,7 +79,9 @@ param(
     [switch]$List,
     [switch]$DryRun,
     [switch]$Force,
+    [string]$Profile = 'expiry',
     [int]$Port = 8080,
+    [string]$Redirect,
     [string]$PubKey,
     [switch]$Quiet
 )
@@ -94,19 +96,28 @@ $OriginalHost = 'https://auth.getmadium.xyz'
 
 # file offset, original bytes, new bytes, VA, description
 $ByteSites = @(
-    @{ Name = 'expiry';   Offset = 0x22231E; Original = @(0x7E, 0x70); New = @(0x90, 0x90); Va = '0x140222F1E'
+    @{ Name = 'expiry';   Offset = 0x22231E; Original = @(0x7E, 0x70); New = @(0x90, 0x90); Va = '0x140222F1E'; Profile = 'expiry'
        Desc = 'expires_at <= now() no longer aborts the verdict' }
-    @{ Name = 'hwid';     Offset = 0x222207; Original = @(0x74, 0x2E); New = @(0xEB, 0x2E); Va = '0x140222E07'
+    @{ Name = 'hwid';     Offset = 0x222207; Original = @(0x74, 0x2E); New = @(0xEB, 0x2E); Va = '0x140222E07'; Profile = 'unlock'
        Desc = 'device binding always continues past the hwid check' }
-    @{ Name = 'clock';    Offset = 0x22227A; Original = @(0x72, 0x71); New = @(0xEB, 0x71); Va = '0x140222E7A'
+    @{ Name = 'clock';    Offset = 0x22227A; Original = @(0x72, 0x71); New = @(0xEB, 0x71); Va = '0x140222E7A'; Profile = 'unlock'
        Desc = 'issuedAt skew window is always accepted' }
-    @{ Name = 'status';   Offset = 0x21EB1F; Original = @(0x74, 0x28); New = @(0xEB, 0x28); Va = '0x14021F71F'
+    @{ Name = 'status';   Offset = 0x21EB1F; Original = @(0x74, 0x28); New = @(0xEB, 0x28); Va = '0x14021F71F'; Profile = 'unlock'
        Desc = 'status string is always taken as the accept branch' }
-    @{ Name = 'sig1';     Offset = 0x21E945; Original = @(0x74, 0x2B); New = @(0x90, 0x90); Va = '0x14021F545'
+    @{ Name = 'sig1';     Offset = 0x21E945; Original = @(0x74, 0x2B); New = @(0x90, 0x90); Va = '0x14021F545'; Profile = 'full'
        Desc = 'Ed25519 result ignored on the verdict path' }
-    @{ Name = 'sig2';     Offset = 0x2221D1; Original = @(0x74, 0x4D); New = @(0x90, 0x90); Va = '0x140222DD1'
+    @{ Name = 'sig2';     Offset = 0x2221D1; Original = @(0x74, 0x4D); New = @(0x90, 0x90); Va = '0x140222DD1'; Profile = 'full'
        Desc = 'Ed25519 result ignored on the sign-in path' }
 )
+
+function Test-Profile([string]$Profile, [string]$SiteProfile) {
+    switch ($Profile) {
+        'expiry' { return $SiteProfile -eq 'expiry' }
+        'unlock' { return $SiteProfile -ne 'full' }
+        'full'   { return $true }
+        default  { return $false }
+    }
+}
 
 $HostOffset   = 0xB2FB94
 $HostLenOffset = 0xB2FBB8
@@ -233,26 +244,50 @@ if ($List -or $Verify) {
 # ---------------------------------------------------------------- patch
 
 if ($Sha -ne $PristineSha256) {
-    if (-not $Force) {
+    # A binary that already carries our patch hashes differently. The per-site byte
+    # assertions below are the real safety net, so only refuse when the file matches
+    # neither the pristine nor the patched state.
+    $allSitesKnown = $true
+    foreach ($site in $ByteSites) {
+        $isOriginal = (Get-ByteState $Bytes $site.Offset $site.Original) -eq 'match'
+        $isPatched = (Get-ByteState $Bytes $site.Offset $site.New) -eq 'match'
+        if (-not $isOriginal -and -not $isPatched) { $allSitesKnown = $false; break }
+    }
+    if ($allSitesKnown) {
+        Write-Log "build already carries this patch (sites match)" 'good'
+    } elseif (-not $Force) {
         Write-Log "sha256 does not match the analysed build" 'warn'
         Write-Log "expected $PristineSha256"
         Write-Log "actual   $Sha"
         Write-Log "this build has not been analysed - use -Force to patch anyway" 'bad'
         exit 4
+    } else {
+        Write-Log "sha256 does not match the analysed build - patching anyway (-Force)" 'warn'
     }
-    Write-Log "sha256 does not match the analysed build - patching anyway (-Force)" 'warn'
 }
 
 $NewHost = "http://127.0.0.1:$Port"
+if ($Redirect) {
+    $NewHost = $Redirect
+    if (-not $NewHost.StartsWith('http://') -and -not $NewHost.StartsWith('https://')) {
+        $NewHost = "http://$NewHost"
+    }
+}
 if ($NewHost.Length -gt $HostCapacity) {
     Write-Log "redirect target longer than the reserved $HostCapacity bytes: $NewHost" 'bad'
     exit 5
+}
+
+if ($Profile -notin @('expiry', 'unlock', 'full')) {
+    Write-Log "unknown profile: $Profile (expected expiry, unlock or full)" 'bad'
+    exit 2
 }
 
 $Buffer = [byte[]]$Bytes.Clone()
 $Changed = 0
 
 foreach ($site in $ByteSites) {
+    if (-not (Test-Profile $Profile $site.Profile)) { continue }
     $state = Get-ByteState $Buffer $site.Offset $site.Original
     if ($state -eq 'match') {
         $Buffer[$site.Offset] = $site.New[0]

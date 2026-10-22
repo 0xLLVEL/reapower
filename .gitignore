@@ -5,6 +5,12 @@
 *.p7
 *.p8
 
+# build artefacts
+*.obj
+*.exp
+*.lib
+*.pdb
+
 # except our own patcher - it is built from source in this repo and is the
 # whole point of the Madium folder, so people do not need a C++ toolchain
 !Madium/tools/madium_unlock.exe

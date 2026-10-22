@@ -123,7 +123,7 @@ if (Test-Path -LiteralPath $KeyPairPub) {
 
 # 2. patch
 $patchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Here 'MadiumPatch.ps1'),
-    '-Target', $Target, '-Port', $Port, '-PubKey', $pubHex)
+    '-Target', $Target, '-Profile', 'full', '-Port', $Port, '-PubKey', $pubHex)
 if ($DryRun) { $patchArgs += '-DryRun' }
 & powershell @patchArgs
 if ($LASTEXITCODE -ne 0) {

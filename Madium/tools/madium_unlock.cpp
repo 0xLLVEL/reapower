@@ -300,15 +300,24 @@ int main(int argc, char** argv) {
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--list") listOnly = true;
-        else if (arg == "--verify") verifyOnly = true;
-        else if (arg == "--in-place") inPlace = true;
-        else if (arg == "--ignore-build-check") ignoreBuildCheck = true;
-        else if (arg == "--out" && i + 1 < argc) outputPath = argv[++i];
-        else if (arg == "--profile" && i + 1 < argc) profile = argv[++i];
-        else if (arg == "--restore" && i + 1 < argc) restoreFrom = argv[++i];
-        else if (arg == "--redirect" && i + 1 < argc) redirect = argv[++i];
-        else if (arg == "--pubkey" && i + 1 < argc) pubkeyHex = argv[++i];
+        // PowerShell treats a leading "--" as an operator and swallows the token
+        // before the process ever sees it, so every long option is also accepted
+        // with a single dash.
+        std::string bare = arg;
+        while (!bare.empty() && bare[0] == '-') bare.erase(bare.begin());
+        auto is = [&](const char* name) {
+            return arg == std::string("--") + name || arg == std::string("-") + name ||
+                   bare == name;
+        };
+        if (is("list")) listOnly = true;
+        else if (is("verify")) verifyOnly = true;
+        else if (is("in-place")) inPlace = true;
+        else if (is("ignore-build-check")) ignoreBuildCheck = true;
+        else if (is("out") && i + 1 < argc) outputPath = argv[++i];
+        else if (is("profile") && i + 1 < argc) profile = argv[++i];
+        else if (is("restore") && i + 1 < argc) restoreFrom = argv[++i];
+        else if (is("redirect") && i + 1 < argc) redirect = argv[++i];
+        else if (is("pubkey") && i + 1 < argc) pubkeyHex = argv[++i];
         else {
             fprintf(stderr, "unrecognized argument: %s\n", arg.c_str());
             printUsage();
@@ -365,20 +374,48 @@ int main(int argc, char** argv) {
     printf("now       %s (local UTC)\n", localUtcTimestamp().c_str());
 
     bool knownBuild = digest == kKnownBuildSha256;
-    if (knownBuild) {
-        printf("build     matches the analyzed Madium 2.6.3 build\n");
-    } else {
-        printf("WARNING   SHA-256 does not match the analyzed build %s\n", kKnownBuildSha256);
-        if (!ignoreBuildCheck) {
-            fprintf(stderr, "aborting: pass --ignore-build-check to patch an unknown build\n");
-            return 1;
-        }
-    }
 
+    // Report modes never write anything, so they must never abort on a build whose
+    // hash differs - a patched binary legitimately hashes differently.
     if (listOnly || verifyOnly) {
         printSites(inspectSites(bytes));
         printHost(bytes);
+        printf("\nfile      %s\n", inputPath.c_str());
+        printf("sha256    %s\n", digest.c_str());
+        printf("build     %s\n", knownBuild ? "matches the analyzed Madium 2.6.3 build"
+                                             : "not the analyzed build (patched or different)");
         return 0;
+    }
+
+    if (knownBuild) {
+        printf("build     matches the analyzed Madium 2.6.3 build\n");
+    } else {
+        // A binary that already carries our patch is expected to hash differently.
+        // The per-site byte assertions below are the real safety net, so only a
+        // binary that matches neither the pristine nor the patched state is refused.
+        bool allSitesKnown = true;
+        for (const Site& site : kSites) {
+            bool isOriginal = site.fileOffset + 2 <= bytes.size() &&
+                             bytes[site.fileOffset] == site.original[0] &&
+                             bytes[site.fileOffset + 1] == site.original[1];
+            bool isPatched = site.fileOffset + 2 <= bytes.size() &&
+                             bytes[site.fileOffset] == site.replacement[0] &&
+                             bytes[site.fileOffset + 1] == site.replacement[1];
+            if (!isOriginal && !isPatched) {
+                allSitesKnown = false;
+                break;
+            }
+        }
+        if (allSitesKnown) {
+            printf("build     already carries this patch (sites match)\n");
+        } else {
+            printf("WARNING   SHA-256 does not match the analyzed build %s\n", kKnownBuildSha256);
+            if (!ignoreBuildCheck) {
+                fprintf(stderr,
+                        "aborting: pass --ignore-build-check to patch an unknown build\n");
+                return 1;
+            }
+        }
     }
 
     std::vector<uint8_t> patched = bytes;
