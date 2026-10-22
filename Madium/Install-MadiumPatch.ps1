@@ -61,11 +61,11 @@ function Find-Python {
     return $null
 }
 
-# ---------------------------------------------------------------- uninstall
-
-if ($Uninstall) {
-    # Stop the endpoint by pid file and by command line, so a stale pid file cannot
-    # leave an orphaned listener behind.
+function Stop-Endpoint {
+    # Stop the endpoint of *this* install only. The pid file is the primary
+    # handle; the command line scan is the fallback for a stale pid file, and it
+    # matches on this install's keypair so an endpoint of another install - a
+    # different port, a different state directory - keeps running.
     $stopped = $false
     if (Test-Path -LiteralPath $PidFile) {
         $mockPid = (Get-Content -LiteralPath $PidFile -Raw).Trim()
@@ -81,12 +81,18 @@ if ($Uninstall) {
         } catch {
             $cmdLineOf = ''
         }
-        if ($cmdLineOf -and $cmdLineOf -like '*madium_mockauth.py*') {
+        if ($cmdLineOf -and $cmdLineOf -like '*madium_mockauth.py*' -and $cmdLineOf -like "*$KeyPair*") {
             Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
             $stopped = $true
         }
     }
-    if ($stopped) { Write-Log 'stopped the local auth endpoint' 'good' }
+    return $stopped
+}
+
+# ---------------------------------------------------------------- uninstall
+
+if ($Uninstall) {
+    if (Stop-Endpoint) { Write-Log 'stopped the local auth endpoint' 'good' }
 
     $backup = "$Target.bak"
     if (Test-Path -LiteralPath $backup) {
@@ -208,24 +214,8 @@ if ($pubkeyLine.Count -ne 1) {
 Write-Log "verified on disk: $($patchedByteSites.Count) byte sites, auth host redirected, pinned key in place" 'good'
 
 # 3. start the local auth endpoint
-# stop a previous instance first
-if (Test-Path -LiteralPath $PidFile) {
-    $oldPid = (Get-Content -LiteralPath $PidFile -Raw).Trim()
-    if ($oldPid -match '^\d+$') {
-        Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
-    }
-    Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-}
-foreach ($candidate in (Get-Process -Name 'python' -ErrorAction SilentlyContinue)) {
-    try {
-        $cmdLineOf = (Get-CimInstance Win32_Process -Filter "ProcessId = $($candidate.Id)").CommandLine
-    } catch {
-        $cmdLineOf = ''
-    }
-    if ($cmdLineOf -and $cmdLineOf -like '*madium_mockauth.py*') {
-        Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
-    }
-}
+# stop a previous instance of *this* install first
+if (Stop-Endpoint) { Write-Log 'stopped the previous endpoint' }
 
 Write-Log "starting the local auth endpoint on 127.0.0.1:$Port"
 # The server detaches itself: it is spawned with its own handles so it never keeps

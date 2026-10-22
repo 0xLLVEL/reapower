@@ -25,6 +25,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 INSTALLER = os.path.join(REPO, "Install-MadiumPatch.ps1")
+MOCK = os.path.join(REPO, "tools", "madium_mockauth.py")
 PORT = 8791
 STATE = os.path.join(tempfile.gettempdir(), "madium_install_state")
 
@@ -51,6 +52,14 @@ def run_installer(target, extra=None, port=None):
     if result.returncode != 0 and result.stderr.strip():
         print("   stderr: " + result.stderr.strip()[:400])
     return result
+
+
+def endpoint_alive(port, timeout=4):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:{}/".format(port), timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def main():
@@ -80,6 +89,23 @@ def main():
     print("   sha256 %s" % sha(target))
 
     print("\n=== B. run the installer (as install.cmd does) ===")
+    # A second, unrelated endpoint on another port and another keypair. It must
+    # survive our install and our uninstall - only this install's own endpoint
+    # may be stopped.
+    foreign_port = PORT + 10
+    foreign_dir = os.path.join(scratch, "foreign")
+    os.makedirs(foreign_dir, exist_ok=True)
+    foreign = subprocess.Popen(
+        [sys.executable, MOCK, "--port", str(foreign_port),
+         "--key-pair", os.path.join(foreign_dir, "kp.json"), "--quiet"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        if endpoint_alive(foreign_port, 2):
+            break
+        time.sleep(0.25)
+    check("a foreign endpoint is running", endpoint_alive(foreign_port),
+          "port {}".format(foreign_port))
+
     result = run_installer(target)
     for line in (result.stdout or "").splitlines():
         print("   | " + line)
@@ -168,6 +194,13 @@ def main():
     except Exception:
         alive = False
     check("endpoint stopped", not alive)
+    check("the foreign endpoint was left alone", endpoint_alive(foreign_port),
+          "port {}".format(foreign_port))
+    foreign.terminate()
+    try:
+        foreign.wait(timeout=5)
+    except Exception:
+        foreign.kill()
 
     shutil.rmtree(scratch, ignore_errors=True)
 
