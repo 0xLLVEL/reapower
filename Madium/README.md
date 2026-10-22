@@ -69,12 +69,27 @@ endpoint signs with Ed25519.
 After install, open Madium and sign in with **any** credentials. The endpoint must stay
 running while the client is open.
 
+### What the installer does, in order
+
+1. makes sure the Ed25519 keypair is complete - a public key whose private half was deleted
+   leaves the endpoint unable to sign, and the client then rejects every verdict, so a
+   half-present keypair is regenerated;
+2. patches the client with `-Profile full` (all six code sites), the auth host redirect and
+   the pinned key;
+3. **re-reads the patched file from disk and checks every component**: six byte sites in the
+   patched state, the auth host redirected, the host length field readable, the pinned key
+   readable. If any of them is missing the installer exits with code 5 and reports which
+   one - it never reports success on a partial patch;
+4. starts the local endpoint detached, waits for its pid file and probes the port before
+   declaring the install done;
+5. keeps a backup that holds the *pristine* bytes. Re-patching an already-patched binary
+   would otherwise leave a "backup" that is the patched file, which makes restore useless -
+   a backup whose hash is not the pristine one is moved aside to `.bak.stale`.
+
 ### Running the patcher by hand
 
-**PowerShell swallows arguments that start with `--`, so use a single dash.** This is a
-PowerShell quirk, not a patcher bug - `--in-place` never reaches the process, so the patch
-lands in a side file instead of the target. Every option accepts `-name`, `--name` and the
-bare `name`.
+Every option accepts `-name`, `--name` and the bare `name`; PowerShell forwards all three to
+a native executable unchanged.
 
 ```powershell
 # 1. generate the keypair and print the public key
@@ -82,22 +97,27 @@ python tools\madium_mockauth.py --port 8080 --key-pair keypair.json --generate-k
 
 # 2. patch the client (copy the public key from step 1)
 .\tools\madium_unlock.exe "$env:LOCALAPPDATA\Madium\Bin\Madium.exe" `
-  -in-place -profile full -redirect 127.0.0.1:8080 -pubkey <PUBLICKEY>
+  --in-place --profile full --redirect 127.0.0.1:8080 --pubkey <PUBLICKEY>
 
 # 3. start the endpoint
 python tools\madium_mockauth.py --port 8080 --key-pair keypair.json
 ```
 
-From `cmd.exe` the double-dash form works as documented:
+`--list` and `--verify` only read the file and always exit 0 - including for a binary that
+is already patched, which legitimately hashes differently. Re-patching an already-patched
+binary is allowed: the per-site byte assertions decide, not the hash.
 
-```
-madium_unlock.exe "%LOCALAPPDATA%\Madium\Bin\Madium.exe" ^
-  --in-place --profile full --redirect 127.0.0.1:8080 --pubkey <PUBLICKEY>
+The endpoint can also be started detached, which is what the installer does:
+
+```powershell
+python tools\madium_mockauth.py --port 8080 --key-pair keypair.json `
+  --quiet --log state\mockauth.log --daemon --pid-file state\mockauth.pid
 ```
 
-`-list` and `-verify` only read the file and always exit 0, even for a binary that is
-already patched. Re-patching an already-patched binary is allowed: the per-site byte
-assertions decide, not the hash.
+`--daemon` spawns a copy of the server with its own handles and writes that copy's pid to
+the pid file. Without it the server inherits the caller's stdout, and a caller that
+captures that output waits for the pipe to close - which means waiting for the whole
+lifetime of the server.
 
 ---
 
@@ -387,6 +407,36 @@ The endpoint announces the moment the client moves on:
 [mock] SUCCESS SIGNAL: client requested /keys/auth/secure
 ```
 
+`tools\install_test.py` runs the whole thing end to end against a scratch copy and checks
+every component of the bypass on disk, not just the exit code:
+
+```
+=== C. every site patched on disk ===
+  [PASS] site expiry patched
+  [PASS] site hwid patched
+  [PASS] site clock patched
+  [PASS] site status patched
+  [PASS] site sig1 patched
+  [PASS] site sig2 patched
+  [PASS] auth host redirected  -> http://127.0.0.1:8791
+  [PASS] host length field updated  -> 21
+  [PASS] pinned key replaced
+=== D. backup + state ===
+  [PASS] backup holds the pristine bytes  -> ad1daac9f09763fb6632df5f92c76073e3c02cb4766917277e6469f9fb9f0a7a
+  [PASS] keypair written
+  [PASS] no keypair leaked into the repo
+=== E. endpoint answers ===
+  [PASS] endpoint is serving
+=== F. re-run the installer (re-patch over a patched binary) ===
+  [PASS] second install exits 0
+=== G. uninstall ===
+  [PASS] uninstall exits 0
+  [PASS] pristine binary restored
+  [PASS] keypair removed
+  [PASS] endpoint stopped
+ALL CHECKS PASSED
+```
+
 ---
 
 ## 7. Exit codes
@@ -404,8 +454,10 @@ The endpoint announces the moment the client moves on:
 
 ## 8. Limits
 
-- **One build.** The patcher refuses a binary whose SHA-256 is not the analysed one. There
-  is no matcher here - the sites are byte-exact, so a re-analysis is needed after an update.
+- **One build.** The patcher refuses a binary whose SHA-256 is not the analysed one, unless
+  every byte site is in a state it recognises - pristine or already patched - in which case
+  the build is accepted and the patch is applied to what is missing. There is no matcher
+  here - the sites are byte-exact, so a re-analysis is needed after an update.
 - **The endpoint must be running.** The client is pointed at `127.0.0.1:8080`. Kill the
   process and the client cannot authenticate.
 - **The patched binary only trusts this endpoint.** Because patch 7 replaces the pinned key,
@@ -431,11 +483,31 @@ tools\madium_mockauth.py   the local auth endpoint - speaks both endpoints, sign
 tools\capture_real.py      capture the real service's raw reply, for any endpoint and credentials
 tools\shape_check.py       prove the response shape against the live service and the client
 tools\madium_unlock.cpp    standalone C++ patcher (same sites, no PowerShell dependency)
+tools\madium_unlock.exe    the compiled patcher, so no C++ toolchain is needed
+tools\install_test.py      end-to-end test of the installer against a scratch copy
+tools\rebuild_pristine.py  reconstruct the pristine binary from a patched one
 ```
 
 `capture_real.py` talks to the real service directly, over TLS, exactly like the client -
 no patching involved. It exists so the protocol can be re-checked without trusting a
 remembered transcript.
+
+`install_test.py` runs the real installer against a copy of the binary in a temp directory
+and then checks all of it: that the installer exits 0, that all eight sites are patched on
+disk, that the backup holds the pristine bytes, that the keypair was written and did not
+leak into the repo, that the endpoint answers, that a second install over an already-patched
+binary still succeeds, that re-patching onto a different port rewrites the host, and that
+the uninstall restores the pristine binary and stops the endpoint.
+
+`rebuild_pristine.py` writes the original bytes back over a patched binary. The patch
+touches a known, bounded set of bytes, so the result must reproduce the pristine SHA-256
+exactly - which is the proof that the patch is the only thing that differs:
+
+```
+> python tools\rebuild_pristine.py Madium.exe pristine.exe
+rebuilt  sha256 ad1daac9f09763fb6632df5f92c76073e3c02cb4766917277e6469f9fb9f0a7a
+written pristine.exe - matches the pristine build exactly
+```
 
 ---
 

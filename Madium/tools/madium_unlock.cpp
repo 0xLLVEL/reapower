@@ -171,6 +171,11 @@ std::string sha256Hex(const std::vector<uint8_t>& bytes) {
 
 // ---------------------------------------------------------------- file io
 
+bool fileExists(const std::string& path) {
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 bool readFile(const std::string& path, std::vector<uint8_t>& out) {
     HANDLE handle = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -246,6 +251,7 @@ void printHost(const std::vector<uint8_t>& bytes) {
     if (kHostStringFileOffset + kHostStringCapacity > bytes.size()) return;
     char host[64] = {};
     std::memcpy(host, bytes.data() + kHostStringFileOffset, kHostStringCapacity);
+    host[sizeof(host) - 1] = '\0';
     uint64_t length = 0;
     std::memcpy(&length, bytes.data() + kHostLengthFileOffset, sizeof(length));
     const char* label = (std::strcmp(host, kOriginalHost) == 0) ? "original" : "redirected";
@@ -260,7 +266,7 @@ void printUsage() {
     printf("  --out <path>            write patched output (default <input>.patched.exe)\n");
     printf("  --in-place              patch the input file, keeping <input>.bak\n");
     printf("  --restore <backup>      copy a backup over the input file\n");
-    printf("  --profile <name>        expiry | unlock | full   (default expiry)\n");
+    printf("  --profile <name>        expiry | unlock | full   (default full)\n");
     printf("  --redirect <host:port>  point the auth host at a local server (needs profile full)\n");
     printf("  --pubkey <64 hex>       replace the pinned Ed25519 verifying key (32 bytes)\n");
     printf("  --ignore-build-check    patch even if the SHA-256 is not the analyzed build\n");
@@ -289,7 +295,7 @@ int main(int argc, char** argv) {
 
     std::string inputPath = argv[1];
     std::string outputPath;
-    std::string profile = "expiry";
+    std::string profile = "full";
     std::string restoreFrom;
     std::string redirect;
     std::string pubkeyHex;
@@ -300,24 +306,15 @@ int main(int argc, char** argv) {
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        // PowerShell treats a leading "--" as an operator and swallows the token
-        // before the process ever sees it, so every long option is also accepted
-        // with a single dash.
-        std::string bare = arg;
-        while (!bare.empty() && bare[0] == '-') bare.erase(bare.begin());
-        auto is = [&](const char* name) {
-            return arg == std::string("--") + name || arg == std::string("-") + name ||
-                   bare == name;
-        };
-        if (is("list")) listOnly = true;
-        else if (is("verify")) verifyOnly = true;
-        else if (is("in-place")) inPlace = true;
-        else if (is("ignore-build-check")) ignoreBuildCheck = true;
-        else if (is("out") && i + 1 < argc) outputPath = argv[++i];
-        else if (is("profile") && i + 1 < argc) profile = argv[++i];
-        else if (is("restore") && i + 1 < argc) restoreFrom = argv[++i];
-        else if (is("redirect") && i + 1 < argc) redirect = argv[++i];
-        else if (is("pubkey") && i + 1 < argc) pubkeyHex = argv[++i];
+        if (arg == "--list") listOnly = true;
+        else if (arg == "--verify") verifyOnly = true;
+        else if (arg == "--in-place") inPlace = true;
+        else if (arg == "--ignore-build-check") ignoreBuildCheck = true;
+        else if (arg == "--out" && i + 1 < argc) outputPath = argv[++i];
+        else if (arg == "--profile" && i + 1 < argc) profile = argv[++i];
+        else if (arg == "--restore" && i + 1 < argc) restoreFrom = argv[++i];
+        else if (arg == "--redirect" && i + 1 < argc) redirect = argv[++i];
+        else if (arg == "--pubkey" && i + 1 < argc) pubkeyHex = argv[++i];
         else {
             fprintf(stderr, "unrecognized argument: %s\n", arg.c_str());
             printUsage();
@@ -374,48 +371,42 @@ int main(int argc, char** argv) {
     printf("now       %s (local UTC)\n", localUtcTimestamp().c_str());
 
     bool knownBuild = digest == kKnownBuildSha256;
-
-    // Report modes never write anything, so they must never abort on a build whose
-    // hash differs - a patched binary legitimately hashes differently.
-    if (listOnly || verifyOnly) {
-        printSites(inspectSites(bytes));
-        printHost(bytes);
-        printf("\nfile      %s\n", inputPath.c_str());
-        printf("sha256    %s\n", digest.c_str());
-        printf("build     %s\n", knownBuild ? "matches the analyzed Madium 2.6.3 build"
-                                             : "not the analyzed build (patched or different)");
-        return 0;
-    }
-
     if (knownBuild) {
         printf("build     matches the analyzed Madium 2.6.3 build\n");
     } else {
-        // A binary that already carries our patch is expected to hash differently.
-        // The per-site byte assertions below are the real safety net, so only a
-        // binary that matches neither the pristine nor the patched state is refused.
-        bool allSitesKnown = true;
-        for (const Site& site : kSites) {
-            bool isOriginal = site.fileOffset + 2 <= bytes.size() &&
-                             bytes[site.fileOffset] == site.original[0] &&
-                             bytes[site.fileOffset + 1] == site.original[1];
-            bool isPatched = site.fileOffset + 2 <= bytes.size() &&
-                             bytes[site.fileOffset] == site.replacement[0] &&
-                             bytes[site.fileOffset + 1] == site.replacement[1];
-            if (!isOriginal && !isPatched) {
-                allSitesKnown = false;
-                break;
-            }
-        }
-        if (allSitesKnown) {
-            printf("build     already carries this patch (sites match)\n");
-        } else {
-            printf("WARNING   SHA-256 does not match the analyzed build %s\n", kKnownBuildSha256);
-            if (!ignoreBuildCheck) {
-                fprintf(stderr,
-                        "aborting: pass --ignore-build-check to patch an unknown build\n");
-                return 1;
-            }
-        }
+        printf("WARNING   SHA-256 does not match the analyzed build %s\n", kKnownBuildSha256);
+    }
+
+    // The report modes never patch anything, so they must not be blocked by the
+    // build check - a binary that already carries the patch hashes differently
+    // and still has to be inspectable.
+    if (listOnly || verifyOnly) {
+        printSites(inspectSites(bytes));
+        printHost(bytes);
+        return 0;
+    }
+
+    // A binary that already carries our patch hashes differently. The per-site
+    // byte assertions are the real safety net, so only refuse when the file
+    // matches neither the pristine nor the patched state.
+    bool allSitesKnown = true;
+    for (const Site& site : kSites) {
+        if (!profileIncludes(profile.c_str(), site.profile)) continue;
+        if (site.fileOffset + 2 > bytes.size()) { allSitesKnown = false; break; }
+        bool isOriginal = bytes[site.fileOffset] == site.original[0] &&
+                          bytes[site.fileOffset + 1] == site.original[1];
+        bool isPatched = bytes[site.fileOffset] == site.replacement[0] &&
+                         bytes[site.fileOffset + 1] == site.replacement[1];
+        if (!isOriginal && !isPatched) { allSitesKnown = false; break; }
+    }
+    if (!knownBuild && allSitesKnown) {
+        printf("build     already carries this patch (sites match)\n");
+        knownBuild = true;
+    }
+
+    if (!knownBuild && !ignoreBuildCheck) {
+        fprintf(stderr, "aborting: pass --ignore-build-check to patch an unknown build\n");
+        return 1;
     }
 
     std::vector<uint8_t> patched = bytes;
@@ -451,21 +442,30 @@ int main(int argc, char** argv) {
         std::string target = "http://" + redirect;
         char current[64] = {};
         std::memcpy(current, patched.data() + kHostStringFileOffset, kHostStringCapacity);
+        current[sizeof(current) - 1] = '\0';
         uint64_t currentLength = 0;
         std::memcpy(&currentLength, patched.data() + kHostLengthFileOffset, sizeof(currentLength));
-        if (std::strcmp(current, kOriginalHost) != 0 && currentLength != target.size()) {
+        bool alreadyOurs = std::strcmp(current, target.c_str()) == 0;
+        bool alreadyRedirected =
+            std::strncmp(current, "http://", 7) == 0 || std::strncmp(current, "https://", 8) == 0;
+        if (std::strcmp(current, kOriginalHost) != 0 && !alreadyOurs && !alreadyRedirected) {
             fprintf(stderr, "host string is already modified (%s / len %llu); refusing to touch it\n",
                     current, (unsigned long long)currentLength);
             return 1;
         }
         // Write only the new bytes: the capacity region is followed by unrelated consts that
-        // must survive. The trailing bytes beyond the new length are never read.
+        // must survive. The bytes between the new string and the end of the reserved
+        // region are cleared so nothing of the old host can leak into a read that
+        // does not stop at the length field.
         std::memcpy(patched.data() + kHostStringFileOffset, target.data(), target.size());
+        for (size_t i = target.size(); i < kHostStringCapacity; ++i) {
+            patched[kHostStringFileOffset + i] = 0;
+        }
         uint64_t newLength = target.size();
         std::memcpy(patched.data() + kHostLengthFileOffset, &newLength, sizeof(newLength));
         ++applied;
         printf("patch     host    file 0x%08X  %s -> %s (len %llu)\n",
-               (unsigned)kHostStringFileOffset, kOriginalHost, target.c_str(),
+               (unsigned)kHostStringFileOffset, current, target.c_str(),
                (unsigned long long)newLength);
     }
 
@@ -491,16 +491,35 @@ int main(int argc, char** argv) {
 
     if (inPlace) {
         std::string backup = inputPath + ".bak";
-        if (!copyFile(inputPath, backup)) {
-            fprintf(stderr, "cannot create backup %s\n", backup.c_str());
-            return 1;
+        // A backup only counts as a backup if it holds the pristine bytes.
+        // Re-patching an already-patched binary would otherwise leave a "backup"
+        // that is just the patched file, which makes restore useless.
+        bool backupIsPristine = false;
+        if (fileExists(backup)) {
+            std::vector<uint8_t> existing;
+            if (readFile(backup, existing) && sha256Hex(existing) == kKnownBuildSha256) {
+                backupIsPristine = true;
+            }
+        }
+        if (!backupIsPristine) {
+            if (fileExists(backup)) {
+                std::string stale = backup + ".stale";
+                printf("backup   %s (not pristine, moved to %s)\n", backup.c_str(), stale.c_str());
+                remove(backup.c_str());
+                rename(backup.c_str(), stale.c_str());
+            }
+            if (!copyFile(inputPath, backup)) {
+                fprintf(stderr, "cannot create backup %s\n", backup.c_str());
+                return 1;
+            }
+        } else {
+            printf("backup   %s (pristine, kept)\n", backup.c_str());
         }
         if (!writeFile(inputPath, patched)) {
             fprintf(stderr, "cannot write %s\n", inputPath.c_str());
             return 1;
         }
-        printf("backup    %s\n", backup.c_str());
-        printf("wrote     %s\n", inputPath.c_str());
+        printf("wrote    %s\n", inputPath.c_str());
     } else {
         if (outputPath.empty()) outputPath = inputPath + ".patched.exe";
         if (!writeFile(outputPath, patched)) {

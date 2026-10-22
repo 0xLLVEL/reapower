@@ -37,6 +37,7 @@ import argparse
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -102,10 +103,15 @@ class MockAuth(BaseHTTPRequestHandler):
     expires_days = 3650
     deny = False
     verbose = True
+    log_stream = None
 
-    def log_message(self, fmt, *args):
-        if self.verbose:
-            sys.stderr.write("[mock] " + (fmt % args) + "\n")
+    @staticmethod
+    def log_message(fmt, *args):
+        line = (fmt % args) if args else fmt
+        if MockAuth.verbose:
+            stream = MockAuth.log_stream or sys.stderr
+            stream.write("[mock] " + line + "\n")
+            stream.flush()
 
     def _json(self, status: int, payload: dict):
         body = json.dumps(payload).encode("utf-8")
@@ -196,6 +202,41 @@ class MockAuth(BaseHTTPRequestHandler):
         self._json(200, {"error": False, "message": self._session(request, token)})
 
 
+def daemonize(args):
+    """Start a detached copy of this server and return immediately.
+
+    The child gets its own handles (DEVNULL), so it never holds a pipe that the
+    caller is reading from. Without that, a caller that captures stdout waits for
+    the pipe to close and therefore waits for the whole lifetime of the server.
+    """
+    script = os.path.abspath(__file__)
+    child_argv = [sys.executable, script]
+    for token in sys.argv[1:]:
+        if token == "--daemon":
+            continue
+        child_argv.append(token)
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                         | getattr(subprocess, "DETACHED_PROCESS", 0))
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_SESSION", 0)
+
+    child = subprocess.Popen(
+        child_argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creationflags,
+    )
+    if args.pid_file:
+        with open(args.pid_file, "w", encoding="ascii") as handle:
+            handle.write(str(child.pid))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Madium local auth server")
     parser.add_argument("--port", type=int, default=8080)
@@ -204,15 +245,29 @@ def main():
     parser.add_argument("--expires-days", type=int, default=3650)
     parser.add_argument("--deny", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--log", default="",
+                        help="write the log to this file instead of stdout")
+    parser.add_argument("--pid-file", default="",
+                        help="write the server pid to this file once it is listening")
+    parser.add_argument("--daemon", action="store_true",
+                        help="start a detached background copy and return immediately")
     parser.add_argument("--generate-key-only", action="store_true",
                         help="create the keypair if needed, print the public key and exit")
     args = parser.parse_args()
+
+    # Detaching from the parent has to happen before anything else: a caller that
+    # captures our stdout waits for the pipe to close, and a long-lived server
+    # holding that pipe would keep the caller waiting forever.
+    if args.daemon:
+        return daemonize(args)
 
     private = load_or_create_keypair(args.key_pair)
     MockAuth.private_key = private
     MockAuth.expires_days = args.expires_days
     MockAuth.deny = args.deny
-    MockAuth.verbose = not args.quiet
+    # The request log is always on - it is the only way to see what the client
+    # asked for. --quiet only silences the startup banner on the console.
+    MockAuth.verbose = True
 
     pub = public_hex(private)
 
@@ -220,20 +275,34 @@ def main():
         print(pub)
         return 0
 
-    print("=" * 76)
-    print("Madium local auth server  (shape-corrected)")
-    print("=" * 76)
-    print("listening        http://{}:{}".format(args.host, args.port))
-    print("key pair file    {}".format(os.path.abspath(args.key_pair)))
-    print()
-    print("Ed25519 public key (32 bytes hex):")
-    print("    {}".format(pub))
-    print()
-    print("success signal   a POST to /keys/auth/secure")
-    print("=" * 76)
-    print()
+    # Writing the log to a file lets the caller start this process without
+    # holding its stdout pipe open, which would otherwise make the caller wait
+    # for the server to exit.
+    if args.log:
+        MockAuth.log_stream = open(args.log, "a", encoding="utf-8", buffering=1)
+
+    if not args.quiet:
+        print("=" * 76)
+        print("Madium local auth server  (shape-corrected)")
+        print("=" * 76)
+        print("listening        http://{}:{}".format(args.host, args.port))
+        print("key pair file    {}".format(os.path.abspath(args.key_pair)))
+        print()
+        print("Ed25519 public key (32 bytes hex):")
+        print("    {}".format(pub))
+        print()
+        print("success signal   a POST to /keys/auth/secure")
+        print("=" * 76)
+        print()
+        sys.stdout.flush()
+    else:
+        MockAuth.log_message("listening on http://%s:%d", args.host, args.port)
+        MockAuth.log_message("key pair file %s", os.path.abspath(args.key_pair))
 
     server = ThreadingHTTPServer((args.host, args.port), MockAuth)
+    if args.pid_file:
+        with open(args.pid_file, "w", encoding="ascii") as handle:
+            handle.write(str(os.getpid()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

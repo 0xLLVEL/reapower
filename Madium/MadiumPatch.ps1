@@ -68,6 +68,11 @@
       3  target locked (Madium running)
       4  dark: signature missing or ambiguous on this build
       5  verify/swap failure (file left on disk untouched)
+
+    Profiles:
+      full    all six code sites, the auth host and the pinned key (default)
+      unlock  everything except the two signature-result sites
+      expiry  only the expiry gate
 #>
 
 [CmdletBinding()]
@@ -79,7 +84,7 @@ param(
     [switch]$List,
     [switch]$DryRun,
     [switch]$Force,
-    [string]$Profile = 'expiry',
+    [string]$Profile = 'full',
     [int]$Port = 8080,
     [string]$Redirect,
     [string]$PubKey,
@@ -94,7 +99,7 @@ if (-not $Target) { $Target = $DefaultTarget }
 $PristineSha256 = 'ad1daac9f09763fb6632df5f92c76073e3c02cb4766917277e6469f9fb9f0a7a'
 $OriginalHost = 'https://auth.getmadium.xyz'
 
-# file offset, original bytes, new bytes, VA, description
+# file offset, original bytes, new bytes, VA, profile, description
 $ByteSites = @(
     @{ Name = 'expiry';   Offset = 0x22231E; Original = @(0x7E, 0x70); New = @(0x90, 0x90); Va = '0x140222F1E'; Profile = 'expiry'
        Desc = 'expires_at <= now() no longer aborts the verdict' }
@@ -110,8 +115,8 @@ $ByteSites = @(
        Desc = 'Ed25519 result ignored on the sign-in path' }
 )
 
-function Test-Profile([string]$Profile, [string]$SiteProfile) {
-    switch ($Profile) {
+function Test-Profile([string]$Selected, [string]$SiteProfile) {
+    switch ($Selected) {
         'expiry' { return $SiteProfile -eq 'expiry' }
         'unlock' { return $SiteProfile -ne 'full' }
         'full'   { return $true }
@@ -245,7 +250,7 @@ if ($List -or $Verify) {
 
 if ($Sha -ne $PristineSha256) {
     # A binary that already carries our patch hashes differently. The per-site byte
-    # assertions below are the real safety net, so only refuse when the file matches
+    # assertions are the real safety net, so only refuse when the file matches
     # neither the pristine nor the patched state.
     $allSitesKnown = $true
     foreach ($site in $ByteSites) {
@@ -254,7 +259,7 @@ if ($Sha -ne $PristineSha256) {
         if (-not $isOriginal -and -not $isPatched) { $allSitesKnown = $false; break }
     }
     if ($allSitesKnown) {
-        Write-Log "build already carries this patch (sites match)" 'good'
+        Write-Log 'build already carries this patch (sites match)' 'good'
     } elseif (-not $Force) {
         Write-Log "sha256 does not match the analysed build" 'warn'
         Write-Log "expected $PristineSha256"
@@ -307,7 +312,11 @@ foreach ($site in $ByteSites) {
 
 # host string + its length
 $currentHost = [System.Text.Encoding]::ASCII.GetString($Buffer, $HostOffset, $HostCapacity).Split([char]0)[0]
-if ($currentHost -eq $OriginalHost) {
+if ($currentHost -eq $NewHost) {
+    Write-Log "skip   host      already redirected"
+} elseif ($currentHost -eq $OriginalHost -or $currentHost -match '^https?://') {
+    # either untouched, or already redirected somewhere else - in both cases the
+    # string is rewritten to the requested target
     for ($i = 0; $i -lt $NewHost.Length; $i++) {
         $Buffer[$HostOffset + $i] = [byte][char]$NewHost[$i]
     }
@@ -317,9 +326,7 @@ if ($currentHost -eq $OriginalHost) {
     $lenBytes = [BitConverter]::GetBytes([UInt64]$NewHost.Length)
     [Array]::Copy($lenBytes, 0, $Buffer, $HostLenOffset, 8)
     $Changed++
-    Write-Log ("patch  {0,-8} file 0x{1:X6}  {2} -> {3} (len {4})" -f 'host', $HostOffset, $OriginalHost, $NewHost, $NewHost.Length)
-} elseif ($currentHost -eq $NewHost) {
-    Write-Log "skip   host      already redirected"
+    Write-Log ("patch  {0,-8} file 0x{1:X6}  {2} -> {3} (len {4})" -f 'host', $HostOffset, $currentHost, $NewHost, $NewHost.Length)
 } else {
     Write-Log "dark   host     holds '$currentHost', expected '$OriginalHost'" 'bad'
     Write-Log "nothing written" 'bad'
@@ -355,7 +362,23 @@ if ($DryRun) {
 }
 
 # backup the pristine bytes once
-if (-not (Test-Path -LiteralPath $Backup)) {
+# A backup only counts as a backup if it actually holds the pristine bytes -
+# re-patching an already-patched binary would otherwise overwrite nothing and
+# leave a "backup" that is just the patched file, which makes restore useless.
+$backupIsPristine = $false
+if (Test-Path -LiteralPath $Backup) {
+    try {
+        $backupIsPristine = (Get-Sha256Hex $Backup) -eq $PristineSha256
+    } catch {
+        $backupIsPristine = $false
+    }
+}
+if (-not $backupIsPristine) {
+    if (Test-Path -LiteralPath $Backup) {
+        $stale = "$Backup.stale"
+        Write-Log "existing backup is not the pristine build - moving it to $stale" 'warn'
+        Move-Item -LiteralPath $Backup -Destination $stale -Force
+    }
     try {
         Copy-Item -LiteralPath $Target -Destination $Backup -Force
         Write-Log "backup  $Backup"
@@ -363,6 +386,8 @@ if (-not (Test-Path -LiteralPath $Backup)) {
         Write-Log "cannot create backup: $($_.Exception.Message)" 'bad'
         exit 5
     }
+} else {
+    Write-Log "backup  $Backup (pristine, kept)"
 }
 
 try {
