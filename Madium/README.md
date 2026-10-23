@@ -36,7 +36,7 @@ loopback that signs its own verdicts with a keypair whose private half never lea
 
 | field | value |
 |---|---|
-| target | `%LOCALAPPDATA%\Madium\Bin\Madium.exe` |
+| target | `%LOCALAPPDATA%\Madium\Bin\Madium.exe`, auto-detected if absent (see 2) |
 | software version | 2.6.3 (installer 1.1.0) |
 | size | 13,352,448 bytes |
 | machine | `0x8664` (x86-64) |
@@ -63,6 +63,25 @@ uninstall.cmd        (restores the pristine Madium.exe, stops the endpoint, remo
 ```
 
 `install.cmd` self-requests UAC. Nothing is scheduled, nothing is watched.
+
+`install.cmd` takes an optional first argument when Madium is not where it expects it - either
+the exe or the install folder, and the path survives the UAC re-launch:
+
+```
+install.cmd                                    auto-detect
+install.cmd "D:\Games\Madium\Bin\Madium.exe"   the exe
+install.cmd "D:\Games\Madium"                  the folder (appends \Bin\Madium.exe)
+```
+
+Auto-detect checks, in order:
+
+```
+%LOCALAPPDATA%\Madium\Bin\Madium.exe
+%USERPROFILE%\Documents\madium\madium\Bin\Madium.exe
+%USERPROFILE%\Documents\madium\Bin\Madium.exe
+```
+
+If nothing matches it names the default path and exits 2 rather than patching the wrong file.
 
 Requires Python 3 with `cryptography` installed (`pip install cryptography`) - the local
 endpoint signs with Ed25519.

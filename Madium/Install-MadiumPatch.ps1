@@ -37,7 +37,22 @@ $ErrorActionPreference = 'Stop'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Tools = Join-Path $Here 'tools'
 $DefaultTarget = Join-Path $env:LOCALAPPDATA 'Madium\Bin\Madium.exe'
-if (-not $Target) { $Target = $DefaultTarget }
+if (-not $Target) {
+    if (Test-Path -LiteralPath $DefaultTarget) {
+        $Target = $DefaultTarget
+    } else {
+        # Madium is often kept under Documents instead of LOCALAPPDATA - fall
+        # back to the two places it has been found in the wild.
+        $candidates = @(
+            (Join-Path $env:USERPROFILE 'Documents\madium\madium\Bin\Madium.exe'),
+            (Join-Path $env:USERPROFILE 'Documents\madium\Bin\Madium.exe')
+        )
+        foreach ($c in $candidates) {
+            if (Test-Path -LiteralPath $c) { $Target = $c; break }
+        }
+    }
+    if (-not $Target) { $Target = $DefaultTarget }
+}
 
 if (-not $StateDir) { $StateDir = Join-Path $env:LOCALAPPDATA 'MadiumUnlock\state' }
 $KeyPair = Join-Path $StateDir 'keypair.json'
